@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SAR Sentinel India
 
 **See the Change. Understand the Risk. Act Sooner.**
@@ -233,3 +234,6 @@ Dashboard demonstration observations, charts, demo polygons, and metrics remain 
 - **Milestone 8:** Automatic NISAR metadata checks, authenticated GCOV acquisition, a separate windowed HH/HV processor with explicit no-valid-corridor-data handling, processing metadata/API, downloadable outputs, and NISAR-specific dashboard display are implemented. The Tungabhadra `A_009` scene produced an unvalidated candidate classification from valid corridor data; the `A_010` scene correctly returned no data. Sentinel-1 RTC acquisition and fallback remain intact.
 - **Milestone 9:** The A_009 candidate has HH-only/HV-only/combined comparisons, five equal-threshold-offset sensitivity cases, and 8-connected fragmentation diagnostics. Bounded Sentinel-2 pixels were inspected and used to create a NoData-preserving exploratory NDWI candidate raster. The dashboard can display that raster as an independent map layer with acquisition/coverage metadata and a candidate/non-candidate/NoData legend. It remains unvalidated and is not ground truth.
 - Existing demonstration overlays, charts, and metrics remain synthetic. Neither NISAR nor Sentinel-1 candidate masks have ground-truth validation. No verified riverbank boundaries, erosion/deposition, flood detection, or scientifically validated change detection is available.
+=======
+# SAR-Sentinel-India
+>>>>>>> origin/main
