@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+backend/.venv/
+backend/__pycache__/
+backend/**/*.py[cod]
+frontend/playwright-report/
+frontend/test-results/
+outputs/*
+!outputs/README.md
+data/*
+!data/README.md
