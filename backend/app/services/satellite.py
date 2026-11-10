@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import HTTPException
 
+from app.redaction import redact_sensitive_text, redact_url
 from app.schemas.satellite import Mission, SatelliteObservation, SatelliteSearchResponse
 from app.services.rivers import RIVER_CATALOG
 
@@ -128,7 +129,7 @@ def _observation(feature: dict[str, Any], mission: Mission) -> SatelliteObservat
         product_type=product_type,
         footprint=feature.get("geometry"),
         metadata_url=metadata_url,
-        download_url=properties.get("url"),
+        download_url=redact_url(properties.get("url")),
         file_size_bytes=file_size,
         source="ASF DAAC",
         analysis_readiness=ANALYSIS_READINESS.get(
@@ -182,7 +183,7 @@ async def search_satellite_catalog(
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(
             status_code=502,
-            detail=f"ASF DAAC metadata search failed: {error}",
+            detail=f"ASF DAAC metadata search failed: {redact_sensitive_text(str(error))}",
         ) from error
 
     features = payload.get("features") if isinstance(payload, dict) else None
@@ -200,7 +201,10 @@ async def search_satellite_catalog(
             for feature in intersecting_features
         ]
     except (TypeError, ValueError) as error:
-        raise HTTPException(status_code=502, detail=f"ASF DAAC returned invalid product metadata: {error}") from error
+        raise HTTPException(
+            status_code=502,
+            detail=f"ASF DAAC returned invalid product metadata: {redact_sensitive_text(str(error))}",
+        ) from error
 
     return SatelliteSearchResponse(
         river_id=river_id,

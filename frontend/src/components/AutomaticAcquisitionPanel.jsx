@@ -62,6 +62,17 @@ function stateLabel(state) {
   })[state] ?? state;
 }
 
+function earthdataAuthenticationLabel(status) {
+  return ({
+    unknown: "unknown",
+    not_configured: "not configured",
+    token_valid: "token valid; product access unverified",
+    data_access_verified: "product access verified by one-byte request",
+    rejected: "rejected or expired",
+    error: "check the river's Earthdata status message",
+  })[status] ?? "unknown";
+}
+
 function jobStateLabel(state) {
   return ({
     queued: "Queued",
@@ -330,7 +341,16 @@ export default function AutomaticAcquisitionPanel({
       {catalog?.nisar_connection_status && (
         <section className="acquisition-source-note" aria-label="NISAR Data Connection Status">
           <h3>NISAR Data Connection Status</h3>
-          <p>Provider: ASF DAAC · Current connectivity: unknown · Authentication: unknown · Last successful search: not recorded.</p>
+          <p>
+            Provider: ASF DAAC · Current connectivity: {catalog.nisar_connection_status.provider_connectivity === "available"
+              ? "available at last successful search"
+              : "unknown"} ·
+            Authentication: {earthdataAuthenticationLabel(catalog.nisar_connection_status.authentication_status)} ·
+            Last successful search: {formatDate(catalog.nisar_connection_status.last_successful_search)}.
+          </p>
+          <p>
+            Earthdata authentication check: {formatDate(catalog.nisar_connection_status.authentication_checked_at)}.
+          </p>
           <p>
             Catalog-reported unique products: {catalog.nisar_connection_status.cached_product_count} ·
             Downloads: {catalog.nisar_connection_status.recorded_download_count} ·
@@ -349,7 +369,7 @@ export default function AutomaticAcquisitionPanel({
           <p>{catalog.nisar_connection_status.recorded_error
             ? "A catalog or processing error is recorded; inspect the affected river or job below."
             : "No error is recorded in the current catalog; past errors may not be retained."}</p>
-          <p>Counts are cached catalog claims, not a live provider check, checksum verification, or independent scientific validation.</p>
+          <p>Connection and authentication labels reflect the latest recorded checks; cached product counts do not verify checksums or scientific validity.</p>
         </section>
       )}
       {jobs.length > 0 && (

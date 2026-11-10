@@ -14,6 +14,39 @@ from app.services import acquisitions
 from app.services.nisar_gcov import NisarGcovProcessingUnavailable
 
 client = TestClient(app)
+TEST_NISAR_PRODUCT_ID = "NISAR_L2_UR_GCOV_TEST_001"
+
+
+def _write_minimal_nisar_product(path: Path, product_id: str) -> None:
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(path, "w") as dataset:
+        dataset.attrs["mission_name"] = "NISAR"
+        dataset.attrs["title"] = "NISAR L2 GCOV Product"
+        identification = dataset.create_group("science/LSAR/identification")
+        for field, value in {
+            "missionId": "NISAR",
+            "platformName": "NISAR",
+            "instrumentName": "LSAR",
+            "productLevel": "L2",
+            "productType": "GCOV",
+            "granuleId": product_id,
+        }.items():
+            identification.create_dataset(field, data=np.bytes_(value))
+        identification.create_dataset("listOfFrequencies", data=np.asarray([b"A"], dtype="S1"))
+        grid = dataset.create_group("science/LSAR/GCOV/grids/frequencyA")
+        grid.create_dataset("HHHH", data=np.ones((2, 2), dtype=np.float32)).attrs.update(
+            {"units": "1", "grid_mapping": "projection"}
+        )
+        grid.create_dataset("HVHV", data=np.ones((2, 2), dtype=np.float32)).attrs.update(
+            {"units": "1", "grid_mapping": "projection"}
+        )
+        grid.create_dataset("mask", data=np.ones((2, 2), dtype=np.uint8))
+        grid.create_dataset("xCoordinates", data=np.asarray([1.0, 2.0]))
+        grid.create_dataset("yCoordinates", data=np.asarray([2.0, 1.0]))
+        grid.create_dataset("xCoordinateSpacing", data=np.float64(1.0))
+        grid.create_dataset("yCoordinateSpacing", data=np.float64(-1.0))
+        grid.create_dataset("listOfPolarizations", data=np.asarray([b"HH", b"HV"], dtype="S2"))
+        grid.create_dataset("projection", data=np.uint32(32643)).attrs["epsg_code"] = 32643
 
 
 def test_automatic_acquisition_is_opt_in(monkeypatch: Any) -> None:
@@ -345,7 +378,212 @@ def test_nisar_product_access_reports_earthdata_authentication_without_bypass(mo
 
     assert state == "authentication_required"
     assert "Earthdata Login" in message
-    assert "No credentials were available" in message
+    assert "Configure EARTHDATA_TOKEN" in message
+    assert "no product bytes were downloaded" in message
+
+
+def test_missing_earthdata_token_is_reported_without_creating_a_session(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("EARTHDATA_TOKEN", raising=False)
+    monkeypatch.setattr(
+        acquisitions,
+        "import_module",
+        lambda _name: pytest.fail("ASF client should not be imported without a token."),
+    )
+
+    session, error = acquisitions._earthdata_session()
+
+    assert session is None
+    assert error == "not_configured"
+    assert "EARTHDATA_TOKEN is not configured" in acquisitions._earthdata_authentication_message(error)
+
+
+def test_invalid_earthdata_token_is_reported_without_logging_the_token(
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    token = "unit-test-earthdata-secret"
+
+    class ASFAuthenticationError(Exception):
+        pass
+
+    class Session:
+        def auth_with_token(self, value: str) -> "Session":
+            raise ASFAuthenticationError(f"Invalid token: {value}")
+
+    monkeypatch.setenv("EARTHDATA_TOKEN", token)
+    monkeypatch.setattr(
+        acquisitions,
+        "import_module",
+        lambda _name: SimpleNamespace(ASFSession=Session),
+    )
+
+    session, error = acquisitions._earthdata_session()
+
+    assert session is None
+    assert error == "rejected"
+    assert "invalid or expired" in acquisitions._earthdata_authentication_message(error)
+    assert token not in caplog.text
+
+
+def test_earthdata_authentication_service_failure_is_not_reported_as_success(
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    token = "unit-test-earthdata-secret"
+
+    class Session:
+        def auth_with_token(self, value: str) -> "Session":
+            raise ConnectionError(f"failed while using {value}")
+
+    monkeypatch.setenv("EARTHDATA_TOKEN", token)
+    monkeypatch.setattr(
+        acquisitions,
+        "import_module",
+        lambda _name: SimpleNamespace(ASFSession=Session),
+    )
+
+    session, error = acquisitions._earthdata_session()
+
+    assert session is None
+    assert error == "error"
+    assert "network request failed" in acquisitions._earthdata_authentication_message(error)
+    assert token not in caplog.text
+
+
+def test_authenticated_nisar_range_probe_verifies_access_without_reading_product(
+    monkeypatch: Any,
+) -> None:
+    class Response:
+        status_code = 206
+        url = "https://nisar.asf.earthdatacloud.nasa.gov/example.h5"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = Response()
+
+    class Session:
+        def get(self, url: str, **kwargs: Any) -> Response:
+            assert url == response.url
+            assert kwargs["headers"]["Range"] == "bytes=0-0"
+            assert kwargs["stream"] is True
+            assert kwargs["allow_redirects"] is True
+            assert kwargs["timeout"] == 30
+            assert "Authorization" not in kwargs["headers"]
+            return response
+
+    status, message = acquisitions._check_nisar_download(response.url, session=Session())
+
+    assert status == "authenticated_access_verified"
+    assert "one-byte range request" in message
+    assert "no full product was downloaded" in message
+    assert response.closed is True
+
+
+def test_authenticated_nisar_range_probe_rejects_denied_access() -> None:
+    class Response:
+        status_code = 403
+        url = "https://nisar.asf.earthdatacloud.nasa.gov/example.h5"
+
+        def close(self) -> None:
+            return None
+
+    class Session:
+        def get(self, _url: str, **_kwargs: Any) -> Response:
+            return Response()
+
+    status, message = acquisitions._check_nisar_download(
+        "https://nisar.asf.earthdatacloud.nasa.gov/example.h5",
+        session=Session(),
+    )
+
+    assert status == "authentication_failed"
+    assert "account authorization" in message
+
+
+def test_nisar_metadata_only_reports_authenticated_access_after_range_probe(
+    monkeypatch: Any,
+) -> None:
+    feature = {
+        "type": "Feature",
+        "id": "NISAR_TEST_PRODUCT",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [75.93, 12.43],
+                [75.95, 12.43],
+                [75.95, 12.45],
+                [75.93, 12.45],
+                [75.93, 12.43],
+            ]],
+        },
+        "properties": {
+            "fileID": "NISAR_TEST_PRODUCT",
+            "url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5",
+            "processingLevel": "GCOV",
+        },
+    }
+    session = object()
+    monkeypatch.setattr(acquisitions, "_search_nisar", lambda _river_id, session=None: [feature])
+    monkeypatch.setattr(
+        acquisitions,
+        "_check_nisar_download",
+        lambda _url, session=None: ("authenticated_access_verified", "range verified")
+        if session is not None
+        else pytest.fail("Authenticated access requires the authenticated session."),
+    )
+
+    result = acquisitions._nisar_metadata("kaveri", session=session)
+
+    assert result["status"] == "metadata_found"
+    assert result["authentication_status"] == "data_access_verified"
+    assert result["last_successful_search"] is not None
+    assert result["products"][0]["availability"] == "authenticated_access_verified"
+
+
+def test_catalog_persists_authenticated_search_evidence(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(acquisitions, "CATALOG_PATH", tmp_path / "catalog.sqlite3")
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "acquisitions")
+    checked_at = "2026-11-10T12:00:00Z"
+    searched_at = "2026-11-10T11:59:59Z"
+    nisar = {
+        "status": "metadata_found",
+        "product_id": "NISAR_TEST_PRODUCT",
+        "acquisition_start": None,
+        "products": [],
+        "message": "Authenticated access verified.",
+        "authentication_status": "data_access_verified",
+        "authentication_checked_at": checked_at,
+        "last_successful_search": searched_at,
+    }
+
+    with acquisitions._catalog_connection() as connection:
+        acquisitions._write_scan(
+            connection,
+            "tungabhadra",
+            "processed",
+            nisar,
+            0,
+            None,
+        )
+
+    status = acquisitions.get_catalog_status().model_dump(mode="json")
+    river = next(item for item in status["rivers"] if item["river_id"] == "tungabhadra")
+    connection_status = status["nisar_connection_status"]
+
+    assert river["earthdata_authentication_status"] == "data_access_verified"
+    assert river["earthdata_authentication_checked_at"] == checked_at
+    assert river["last_successful_nisar_search"] == searched_at
+    assert connection_status["authentication_status"] == "data_access_verified"
+    assert connection_status["last_successful_search"] == searched_at
 
 
 def test_authenticated_nisar_search_uses_asf_search_session(monkeypatch: Any) -> None:
@@ -444,6 +682,50 @@ def test_nisar_metadata_preserves_product_details_without_authentication(
     assert metadata["products"][0]["polarization"] is None
 
 
+def test_authenticated_product_lookup_keeps_signed_url_transient(
+    monkeypatch: Any,
+) -> None:
+    product_id = TEST_NISAR_PRODUCT_ID
+    raw_url = "https://nisar.asf.earthdatacloud.nasa.gov/test.h5?X-Amz-Signature=private"
+    feature = {
+        "type": "Feature",
+        "id": product_id,
+        "properties": {
+            "fileID": product_id,
+            "url": raw_url,
+            "processingLevel": "GCOV",
+            "bytes": {"test.h5": {"bytes": 1024}},
+            "sha256sum": "a" * 64,
+        },
+    }
+
+    class Result:
+        def geojson(self) -> dict[str, Any]:
+            return feature
+
+    class ASF:
+        @staticmethod
+        def ASFSearchOptions(*, session: object) -> object:
+            assert session is marker
+            return object()
+
+        @staticmethod
+        def granule_search(ids: list[str], *, opts: object) -> list[Result]:
+            assert ids == [product_id]
+            assert opts is not None
+            return [Result()]
+
+    marker = object()
+    monkeypatch.setattr(acquisitions, "import_module", lambda _name: ASF)
+
+    product = acquisitions._search_nisar_product_by_id(product_id, marker)
+
+    assert product["_download_url"] == raw_url
+    assert product["source_url"] == "https://nisar.asf.earthdatacloud.nasa.gov/test.h5"
+    assert product["provider_checksum_algorithm"] == "sha256"
+    assert product["provider_checksum"] == "a" * 64
+
+
 def test_catalog_serializes_nisar_products_with_download_state(
     monkeypatch: Any,
     tmp_path: Any,
@@ -458,7 +740,8 @@ def test_catalog_serializes_nisar_products_with_download_state(
         "size_bytes": 1024,
         "availability": "authenticated_catalog",
         "download_status": "not_attempted",
-        "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5",
+        "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5?sig=private",
+        "_download_url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5?sig=private",
         "local_path": None,
         "hdf5_groups": [],
         "message": None,
@@ -486,87 +769,358 @@ def test_catalog_serializes_nisar_products_with_download_state(
     assert river.nisar_products[0].product_id == "NISAR_TEST_PRODUCT"
     assert river.nisar_products[0].polarization == ["HH", "HV"]
     assert river.nisar_products[0].download_status == "not_attempted"
+    assert river.nisar_products[0].source_url == "https://nisar.asf.earthdatacloud.nasa.gov/test.h5"
 
 
-def test_nisar_download_verifies_hdf5_and_records_only_relative_path(
-    monkeypatch: Any,
-    tmp_path: Any,
-) -> None:
-    h5py = pytest.importorskip("h5py")
-    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "acquisitions")
-    product = {
-        "product_id": "NISAR_TEST_PRODUCT",
-        "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5",
-        "size_bytes": 1,
-        "download_status": "not_attempted",
-        "availability": "authenticated_catalog",
-        "hdf5_groups": [],
-    }
+class _DownloadResponse:
+    def __init__(
+        self,
+        status_code: int,
+        headers: dict[str, str],
+        chunks: list[bytes],
+        fail_after_first: bool = False,
+        url: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers
+        self.chunks = chunks
+        self.fail_after_first = fail_after_first
+        self.url = url
+        self.closed = False
 
-    def download_urls(*, urls: list[str], path: str, session: object) -> None:
-        assert urls == [product["source_url"]]
-        with h5py.File(Path(path) / "test.h5", "w") as output:
-            grids = output.create_group("science/LSAR/GCOV/grids")
-            for frequency in ("frequencyA", "frequencyB"):
-                grids.create_group(frequency).create_dataset(
-                    "listOfPolarizations",
-                    data=[b"HH", b"HV"],
-                )
-        product["size_bytes"] = (Path(path) / "test.h5").stat().st_size
+    def iter_content(self, chunk_size: int):
+        del chunk_size
+        for index, chunk in enumerate(self.chunks):
+            yield chunk
+            if self.fail_after_first and index == 0:
+                raise TimeoutError("simulated interrupted transfer")
 
-    monkeypatch.setattr(
-        acquisitions,
-        "import_module",
-        lambda name: SimpleNamespace(download_urls=download_urls),
-    )
-
-    result = acquisitions._download_nisar_product("kaveri", product, object())
-
-    assert result["availability"] == "downloaded_verified"
-    assert result["download_status"] == "downloaded"
-    assert result["hdf5_groups"] == ["science"]
-    assert result["polarization"] == ["HH", "HV"]
-    assert result["local_path"].endswith("test.h5")
-    assert (tmp_path / result["local_path"]).is_file()
-    assert "Processing is available separately" in result["message"]
+    def close(self) -> None:
+        self.closed = True
 
 
-def test_invalid_nisar_download_never_replaces_final_product_or_leaves_staging_files(
-    monkeypatch: Any,
-    tmp_path: Any,
-) -> None:
-    pytest.importorskip("h5py")
-    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
-    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "acquisitions")
-    product = {
-        "product_id": "NISAR_INVALID_TEST_PRODUCT",
-        "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/test.h5",
+def _download_product(product_id: str = TEST_NISAR_PRODUCT_ID) -> dict[str, Any]:
+    return {
+        "product_id": product_id,
+        "product_level": "GCOV",
+        "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/product.h5",
+        "_download_url": "https://nisar.asf.earthdatacloud.nasa.gov/product.h5?X-Amz-Signature=private",
+        "source_url_reference": "https://nisar.asf.earthdatacloud.nasa.gov/product.h5",
         "size_bytes": None,
         "download_status": "not_attempted",
         "availability": "authenticated_catalog",
         "hdf5_groups": [],
     }
 
-    def write_invalid_download(*, urls: list[str], path: str, session: object) -> None:
-        staged_path = Path(path) / "test.h5"
-        staged_path.write_bytes(b"not an HDF5 file")
-        product["size_bytes"] = staged_path.stat().st_size
 
-    monkeypatch.setattr(
-        acquisitions,
-        "import_module",
-        lambda _name: SimpleNamespace(download_urls=write_invalid_download),
+def test_nisar_download_verifies_full_file_checksum_and_metadata(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("h5py")
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    source = tmp_path / f"{TEST_NISAR_PRODUCT_ID}.h5"
+    _write_minimal_nisar_product(source, TEST_NISAR_PRODUCT_ID)
+    payload = source.read_bytes()
+    digest = acquisitions.calculate_checksums(source)["sha256"]
+    response = _DownloadResponse(
+        200,
+        {"Content-Length": str(len(payload))},
+        [payload],
     )
 
-    with pytest.raises(OSError):
-        acquisitions._download_nisar_product("kaveri", product, object())
+    class Session:
+        def get(self, url: str, **kwargs: Any) -> _DownloadResponse:
+            assert "X-Amz-Signature=private" in url
+            assert kwargs["stream"] is True
+            return response
+
+    product = _download_product()
+    product["size_bytes"] = len(payload)
+    product["provider_checksum_algorithm"] = "sha256"
+    product["provider_checksum"] = digest
+
+    result = acquisitions._download_nisar_product("kaveri", product, Session())
+
+    final_path = tmp_path / result["local_path"]
+    manifest_path = final_path.parent / "download-verification.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert response.closed
+    assert final_path.read_bytes() == payload
+    assert result["download_status"] == "downloaded"
+    assert result["sha256"] == digest
+    assert result["integrity_status"] == "provider_checksum_verified"
+    assert result["structure_verification_status"] == "verified"
+    assert result["provider_authenticity_status"] == "provider_checksum_verified"
+    assert result["scientific_validation_status"] == "not_performed"
+    assert result["download_timestamp"]
+    assert result["acquisition_identifier"] == TEST_NISAR_PRODUCT_ID
+    assert result["size_bytes"] == len(payload)
+    assert result["source_url_reference"] == "https://nisar.asf.earthdatacloud.nasa.gov/product.h5"
+    assert manifest["acquisition_identifier"] == TEST_NISAR_PRODUCT_ID
+    assert manifest["product_type"] == "GCOV"
+    assert manifest["file_size_bytes"] == len(payload)
+    assert "X-Amz-Signature" not in manifest["source_url_reference"]
+    assert "private" not in manifest["source_url_reference"]
+
+    class NoNetwork:
+        def get(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("A verified product must be reused without another request.")
+
+    reused = _download_product()
+    reused.update(
+        {
+            "size_bytes": len(payload),
+            "provider_checksum_algorithm": "sha256",
+            "provider_checksum": digest,
+        }
+    )
+    assert acquisitions._download_nisar_product("kaveri", reused, NoNetwork())["sha256"] == digest
+
+
+def test_catalog_product_record_drops_signed_url_and_query_parameters() -> None:
+    record = acquisitions._catalog_product_records(
+        [
+            {
+                "product_id": TEST_NISAR_PRODUCT_ID,
+                "source_url": "https://nisar.asf.earthdatacloud.nasa.gov/file.h5?sig=private",
+                "_download_url": "https://nisar.asf.earthdatacloud.nasa.gov/file.h5?sig=private",
+            }
+        ]
+    )[0]
+
+    assert "_download_url" not in record
+    assert record["source_url"] == "https://nisar.asf.earthdatacloud.nasa.gov/file.h5"
+    assert "private" not in json.dumps(record)
+
+
+def test_nisar_download_recovers_verified_staging_directory_after_finalize_interruption(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("h5py")
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    source = tmp_path / f"{TEST_NISAR_PRODUCT_ID}.h5"
+    _write_minimal_nisar_product(source, TEST_NISAR_PRODUCT_ID)
+    payload = source.read_bytes()
+    product = _download_product()
+    product["size_bytes"] = len(payload)
+    response = _DownloadResponse(
+        200,
+        {"Content-Length": str(len(payload))},
+        [payload],
+    )
+    river_directory = tmp_path / "data" / "acquisitions" / "kaveri"
+    staging_directory = river_directory / f".nisar-download-{TEST_NISAR_PRODUCT_ID}"
+    product_directory = river_directory / TEST_NISAR_PRODUCT_ID
+    real_replace = acquisitions.os.replace
+
+    def interrupt_final_directory_rename(source_path: Any, destination_path: Any) -> None:
+        if Path(source_path) == staging_directory and Path(destination_path) == product_directory:
+            raise PermissionError("simulated process interruption before atomic finalization")
+        real_replace(source_path, destination_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(acquisitions.os, "replace", interrupt_final_directory_rename)
+        with pytest.raises(PermissionError, match="simulated process interruption"):
+            acquisitions._download_nisar_product(
+                "kaveri",
+                product,
+                SimpleNamespace(get=lambda *_args, **_kwargs: response),
+            )
+
+    class NoNetwork:
+        def get(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("A complete staged product should be finalized without redownloading.")
+
+    recovered = acquisitions._download_nisar_product("kaveri", product, NoNetwork())
+    assert recovered["download_status"] == "downloaded"
+    assert (tmp_path / recovered["local_path"]).read_bytes() == payload
+
+
+def test_provider_checksum_metadata_is_normalized_and_rejects_malformed_values() -> None:
+    assert acquisitions._provider_checksum({"md5sum": "A" * 32}) == (
+        "md5",
+        "a" * 32,
+    )
+    with pytest.raises(ValueError, match="malformed"):
+        acquisitions._provider_checksum({"sha256sum": "not-a-checksum"})
+
+
+def test_nisar_download_resumes_interruption_and_records_fingerprint_without_provider_checksum(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("h5py")
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    source = tmp_path / f"{TEST_NISAR_PRODUCT_ID}.h5"
+    _write_minimal_nisar_product(source, TEST_NISAR_PRODUCT_ID)
+    payload = source.read_bytes()
+    split = len(payload) // 2
+    first = _DownloadResponse(
+        200,
+        {"Content-Length": str(len(payload))},
+        [payload[:split]],
+        fail_after_first=True,
+    )
+    second = _DownloadResponse(
+        206,
+        {"Content-Range": f"bytes {split}-{len(payload) - 1}/{len(payload)}"},
+        [payload[split:]],
+    )
+
+    class Session:
+        def __init__(self) -> None:
+            self.responses = [first, second]
+            self.headers: list[dict[str, str]] = []
+
+        def get(self, _url: str, **kwargs: Any) -> _DownloadResponse:
+            self.headers.append(kwargs["headers"])
+            return self.responses.pop(0)
+
+    session = Session()
+    product = _download_product()
+    product["size_bytes"] = len(payload)
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        acquisitions._download_nisar_product("kaveri", product, session)
+    pending = (
+        tmp_path / "data" / "acquisitions" / "kaveri"
+        / f".nisar-download-{TEST_NISAR_PRODUCT_ID}"
+        / "product.h5.part"
+    )
+    assert pending.stat().st_size == split
+
+    result = acquisitions._download_nisar_product("kaveri", product, session)
+    final_path = tmp_path / result["local_path"]
+    assert session.headers[1]["Range"] == f"bytes={split}-"
+    assert final_path.read_bytes() == payload
+    assert result["integrity_status"] == "sha256_fingerprint_only"
+    assert result["provider_authenticity_status"] == "not_verified"
+
+
+@pytest.mark.parametrize(
+    ("payload", "provider_checksum", "message"),
+    [
+        (b"not an HDF5 product", None, "HDF5"),
+        (None, "0" * 64, "provider checksum"),
+    ],
+)
+def test_invalid_or_corrupted_nisar_download_is_not_finalized(
+    monkeypatch: Any,
+    tmp_path: Path,
+    payload: bytes | None,
+    provider_checksum: str | None,
+    message: str,
+) -> None:
+    pytest.importorskip("h5py")
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    if payload is None:
+        source = tmp_path / f"{TEST_NISAR_PRODUCT_ID}.h5"
+        _write_minimal_nisar_product(source, TEST_NISAR_PRODUCT_ID)
+        payload = source.read_bytes()
+    response = _DownloadResponse(200, {"Content-Length": str(len(payload))}, [payload])
+    product = _download_product()
+    product["size_bytes"] = len(payload)
+    if provider_checksum is not None:
+        product["provider_checksum_algorithm"] = "sha256"
+        product["provider_checksum"] = provider_checksum
+
+    with pytest.raises(RuntimeError, match=message):
+        acquisitions._download_nisar_product(
+            "kaveri",
+            product,
+            SimpleNamespace(get=lambda *_args, **_kwargs: response),
+        )
 
     product_directory = (
-        tmp_path / "acquisitions" / "kaveri" / "NISAR_INVALID_TEST_PRODUCT"
+        tmp_path / "data" / "acquisitions" / "kaveri" / TEST_NISAR_PRODUCT_ID
     )
-    assert not (product_directory / "test.h5").exists()
-    assert list(product_directory.glob(".nisar-download-*")) == []
+    assert not product_directory.exists()
+    assert not list(product_directory.parent.glob(".nisar-download-*/" + "*.h5.part"))
+
+
+def test_nisar_download_rejects_invalid_hdf5_product_identity(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("h5py")
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    source = tmp_path / "invalid.h5"
+    _write_minimal_nisar_product(source, "NISAR_L2_UR_GCOV_DIFFERENT_001")
+    payload = source.read_bytes()
+    response = _DownloadResponse(200, {"Content-Length": str(len(payload))}, [payload])
+
+    with pytest.raises(RuntimeError, match="granuleId"):
+        acquisitions._download_nisar_product(
+            "kaveri",
+            _download_product(),
+            SimpleNamespace(get=lambda *_args, **_kwargs: response),
+        )
+
+    assert not (
+        tmp_path / "data" / "acquisitions" / "kaveri" / TEST_NISAR_PRODUCT_ID
+    ).exists()
+
+
+def test_nisar_download_credential_failure_does_not_expose_signed_url(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    response = _DownloadResponse(401, {}, [])
+
+    with pytest.raises(PermissionError) as error:
+        acquisitions._download_nisar_product(
+            "kaveri",
+            _download_product(),
+            SimpleNamespace(get=lambda *_args, **_kwargs: response),
+        )
+    assert "private" not in str(error.value)
+    assert "X-Amz-Signature" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "headers", "response_url", "expected_error"),
+    [
+        (200, {"Content-Type": "text/html"}, None, "login page"),
+        (200, {}, "https://urs.earthdata.nasa.gov/login", "login page"),
+        (500, {}, None, "HTTP 500"),
+    ],
+)
+def test_nisar_download_handles_expired_auth_and_http_errors_safely(
+    monkeypatch: Any,
+    tmp_path: Path,
+    status_code: int,
+    headers: dict[str, str],
+    response_url: str | None,
+    expected_error: str,
+) -> None:
+    monkeypatch.setattr(acquisitions, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "data" / "acquisitions")
+    monkeypatch.setattr(acquisitions, "NISAR_DOWNLOAD_RESERVE_BYTES", 0)
+    response = _DownloadResponse(status_code, headers, [], url=response_url)
+
+    with pytest.raises((PermissionError, RuntimeError), match=expected_error) as error:
+        acquisitions._download_nisar_product(
+            "kaveri",
+            _download_product(),
+            SimpleNamespace(get=lambda *_args, **_kwargs: response),
+        )
+    assert "private" not in str(error.value)
+    assert "X-Amz-Signature" not in str(error.value)
 
 
 def test_nisar_size_bytes_uses_hdf5_asset_size() -> None:
@@ -599,9 +1153,7 @@ def test_refresh_preserves_and_recovers_local_nisar_products(
     product_directory = acquisitions.ACQUISITION_ROOT / "tungabhadra" / product_id
     product_directory.mkdir(parents=True)
     product_path = product_directory / f"{product_id}.h5"
-    with h5py.File(product_path, "w") as dataset:
-        grid = dataset.create_group("science/LSAR/GCOV/grids/frequencyA")
-        grid.create_dataset("listOfPolarizations", data=[b"HH", b"HV"])
+    _write_minimal_nisar_product(product_path, product_id)
     processing_directory = product_directory / "nisar-processing"
     processing_directory.mkdir()
     (processing_directory / "processing-metadata.json").write_text(
@@ -670,9 +1222,7 @@ def test_catalog_status_recovers_hdf5_product_missing_from_sqlite(
     )
     product_directory = acquisitions.ACQUISITION_ROOT / "tungabhadra" / product_id
     product_directory.mkdir(parents=True)
-    with h5py.File(product_directory / f"{product_id}.h5", "w") as dataset:
-        grid = dataset.create_group("science/LSAR/GCOV/grids/frequencyA")
-        grid.create_dataset("listOfPolarizations", data=[b"HH", b"HV"])
+    _write_minimal_nisar_product(product_directory / f"{product_id}.h5", product_id)
     with acquisitions._catalog_connection() as connection:
         acquisitions._write_scan(
             connection,

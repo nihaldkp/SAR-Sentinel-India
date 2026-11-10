@@ -34,6 +34,17 @@ from app.schemas.catalog import HealthResponse, Observation, Region
 from app.schemas.reference_lifecycle import BoundAssessmentCalculation, BoundAssessmentEvent, BoundAssessmentReservation, BoundReferenceMetadata, BoundReferenceRecord, CandidateIdentity, ReferenceEligibility, ReviewAction
 from app.schemas.rivers import River
 from app.schemas.satellite import SatelliteSearchResponse
+from app.schemas.integration import (
+    AcquisitionVerification,
+    GISJobCreate,
+    IntegrationAssociation,
+    IntegrationAssociationCreate,
+    IntegrationJob,
+    OutputRegistrationRequest,
+    ProcessingJobCreate,
+    VerifiedAcquisition,
+    VerifiedAcquisitionPage,
+)
 from app.schemas.validation import (
     EvaluationRejection,
     ExploratoryMethodMetadata,
@@ -51,6 +62,7 @@ from app.schemas.validation import (
 from app.services import analysis
 from app.services import acquisitions
 from app.services import acquisition_jobs
+from app.services import integration
 from app.services import reference_lifecycle
 from app.services import ai_analysis
 from app.services import nwic_river_explorer
@@ -179,6 +191,240 @@ async def search_satellite(
 @router.get("/acquisitions", response_model=AcquisitionStatus, tags=["satellite"])
 def get_acquisitions() -> AcquisitionStatus:
     return acquisitions.get_catalog_status()
+
+
+@router.get(
+    "/integration/acquisitions",
+    response_model=VerifiedAcquisitionPage,
+    tags=["integration"],
+)
+def list_verified_nisar_acquisitions(
+    river_id: str | None = Query(default=None, max_length=80),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+) -> VerifiedAcquisitionPage:
+    try:
+        return VerifiedAcquisitionPage.model_validate(
+            integration.list_verified_acquisitions(
+                river_id=river_id,
+                limit=limit,
+                offset=offset,
+            )
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/integration/acquisitions/{river_id}/{product_id}",
+    response_model=VerifiedAcquisition,
+    tags=["integration"],
+)
+def get_verified_nisar_acquisition(
+    river_id: str,
+    product_id: str,
+) -> VerifiedAcquisition:
+    try:
+        return integration.get_verified_acquisition(river_id, product_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/integration/acquisitions/{river_id}/{product_id}/verification",
+    response_model=AcquisitionVerification,
+    tags=["integration"],
+)
+def get_nisar_acquisition_verification(
+    river_id: str,
+    product_id: str,
+) -> AcquisitionVerification:
+    try:
+        return integration.get_acquisition_verification(river_id, product_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/processing/jobs",
+    response_model=IntegrationJob,
+    status_code=202,
+    tags=["integration"],
+)
+def submit_sar_processing_job(request: ProcessingJobCreate) -> IntegrationJob:
+    try:
+        return integration.create_processing_job(request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/processing/jobs",
+    tags=["integration"],
+)
+def list_sar_processing_jobs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+) -> dict:
+    return integration.list_jobs(job_type="sar_processing", limit=limit, offset=offset)
+
+
+@router.get(
+    "/processing/jobs/{job_id}",
+    response_model=IntegrationJob,
+    tags=["integration"],
+)
+def get_sar_processing_job(job_id: str) -> IntegrationJob:
+    job = integration.get_job(job_id, "sar_processing")
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"SAR processing job {job_id} was not found.")
+    return job
+
+
+@router.post(
+    "/processing/jobs/{job_id}/outputs",
+    response_model=IntegrationJob,
+    tags=["integration"],
+)
+def register_sar_processing_outputs(
+    job_id: str,
+    request: OutputRegistrationRequest,
+) -> IntegrationJob:
+    try:
+        job = integration.get_job(job_id, "sar_processing")
+        if job is None:
+            raise FileNotFoundError(f"SAR processing job {job_id} was not found.")
+        return integration.register_outputs(job_id, request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationOutputUnavailable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except integration.IntegrationJobNotRetryable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/gis/jobs",
+    response_model=IntegrationJob,
+    status_code=202,
+    tags=["integration"],
+)
+def submit_gis_analysis_job(request: GISJobCreate) -> IntegrationJob:
+    try:
+        return integration.create_gis_job(request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationOutputUnavailable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/gis/jobs",
+    tags=["integration"],
+)
+def list_gis_analysis_jobs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+) -> dict:
+    return integration.list_jobs(job_type="gis_analysis", limit=limit, offset=offset)
+
+
+@router.get(
+    "/gis/jobs/{job_id}",
+    response_model=IntegrationJob,
+    tags=["integration"],
+)
+def get_gis_analysis_job(job_id: str) -> IntegrationJob:
+    job = integration.get_job(job_id, "gis_analysis")
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"GIS analysis job {job_id} was not found.")
+    return job
+
+
+@router.post(
+    "/gis/jobs/{job_id}/outputs",
+    response_model=IntegrationJob,
+    tags=["integration"],
+)
+def register_gis_analysis_outputs(
+    job_id: str,
+    request: OutputRegistrationRequest,
+) -> IntegrationJob:
+    try:
+        job = integration.get_job(job_id, "gis_analysis")
+        if job is None:
+            raise FileNotFoundError(f"GIS analysis job {job_id} was not found.")
+        return integration.register_outputs(job_id, request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationOutputUnavailable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except integration.IntegrationJobNotRetryable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/gis/jobs/{job_id}/results",
+    response_model=IntegrationJob,
+    tags=["integration"],
+)
+def get_gis_analysis_results(job_id: str) -> IntegrationJob:
+    try:
+        return integration.get_gis_result(job_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationOutputUnavailable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except integration.IntegrationJobNotRetryable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/gis/jobs/{job_id}/association",
+    response_model=IntegrationAssociation,
+    tags=["integration"],
+)
+def associate_gis_result(
+    job_id: str,
+    request: IntegrationAssociationCreate,
+) -> IntegrationAssociation:
+    try:
+        return integration.associate_job(job_id, request)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationJobNotRetryable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/integration/jobs/{job_id}/retry",
+    response_model=IntegrationJob,
+    status_code=202,
+    tags=["integration"],
+)
+def retry_integration_job(job_id: str) -> IntegrationJob:
+    try:
+        return integration.retry_job(job_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except integration.IntegrationJobNotRetryable as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.post(

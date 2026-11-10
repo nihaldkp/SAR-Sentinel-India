@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # SAR Sentinel India
 
 **See the Change. Understand the Risk. Act Sooner.**
@@ -6,8 +5,10 @@
 SAR Sentinel India is an Earth-observation project for exploring river-region SAR data. Existing dashboard metrics and preview layers remain explicitly demonstration data. Its automatic service discovers NISAR and Sentinel-1 RTC products; the separate NISAR GCOV workflow has processed an authenticated Tungabhadra scene into an unvalidated, single-date candidate open-water classification.
 
 The dashboard's **NISAR Data Connection Status** summarizes catalog-reported
-product stages. Live provider connectivity, authentication and the last
-successful search are unknown unless independently tested; counts do not
+product stages and the latest recorded provider checks. The opt-in live check
+verified authenticated access to one known product using a one-byte range
+request; until a catalog scan records its own checks, dashboard connectivity,
+authentication and last successful search can remain unknown. Counts do not
 establish file integrity or scientific validation. See the
 [NISAR connection audit](./data/NISAR-CONNECTION-AUDIT.md) for verified evidence
 and remaining gaps. Automatic acquisition remains opt-in.
@@ -131,7 +132,7 @@ The map includes OpenStreetMap/Nominatim relation centerlines for the Kaveri (re
 
 ## Automatic real satellite acquisition
 
-Automatic acquisition scheduling is **disabled by default**. To opt in, set `SAR_AUTO_ACQUISITION_ENABLED=true`; only then does FastAPI start the background task, check both river centerlines, and repeat at the configured interval (six hours by default; configurable with `SAR_ACQUISITION_POLL_SECONDS`). It first searches the ASF DAAC NISAR GCOV catalog. When `EARTHDATA_TOKEN` is configured, it authenticates with ASF's supported `asf_search.ASFSession.auth_with_token()` client and attempts one product download per catalog refresh. Downloaded NISAR HDF5 files are validated for readable top-level groups and registered in the SQLite river catalog. Without a usable token, NISAR access is reported and the service continues with Sentinel-1. Set the token in the process environment or in the ignored repository-root `.env`; never commit that file.
+Automatic acquisition scheduling is **disabled by default**. To opt in, set `SAR_AUTO_ACQUISITION_ENABLED=true`; only then does FastAPI start the background task, check both river centerlines, and repeat at the configured interval (six hours by default; configurable with `SAR_ACQUISITION_POLL_SECONDS`). It first searches the ASF DAAC NISAR GCOV catalog. When `EARTHDATA_TOKEN` is configured, it authenticates with ASF's supported `asf_search.ASFSession.auth_with_token()` client and attempts one product download per catalog refresh. Downloads stream into an ignored resumable partial file, then verify the complete byte count, SHA-256, any ASF-provided checksum, GCOV structure, and embedded product identity before atomic finalization and SQLite registration. Without a usable token, NISAR access is reported and the service continues with Sentinel-1. Set the token in the process environment or in the ignored repository-root `.env`; never commit that file.
 
 ### Exploratory Sentinel-2 tile candidates
 
@@ -148,22 +149,151 @@ The downloaded linear-power VV data are processed with a 5×5 Lee-style filter a
 Sources and access APIs:
 
 - ASF DAAC search: `https://api.daac.asf.alaska.edu/services/search/param`
+- ASF NISAR access guidance: [Finding NISAR Data with ASF Search](https://nisar-docs.asf.alaska.edu/asf-search/)
+- Earthdata Login token guide: [User Token Management](https://urs.earthdata.nasa.gov/documentation/for_users/user_token)
+- `earthaccess` authentication guide (for other Earthdata API/cloud workflows): [Authenticate with Earthdata Login](https://earthaccess.readthedocs.io/en/stable/user/howto/authenticate/)
 - Microsoft Planetary Computer Sentinel-1 RTC STAC: `https://planetarycomputer.microsoft.com/api/stac/v1/collections/sentinel-1-rtc`
 - Microsoft Planetary Computer read-only token API: `https://planetarycomputer.microsoft.com/api/sas/v1/openapi.json`
 - Sentinel-1 RTC terms: CC BY 4.0, as declared by its STAC collection.
 - OSM centerline attribution/licence is recorded with the existing river dataset.
 
-### Configure an Earthdata token on Windows
+### Configure and verify NASA Earthdata authentication
 
-The root `.env` file is ignored by Git. If `EARTHDATA_TOKEN` is already set in the PowerShell terminal that starts the backend, copy it into that local file without putting its value in shell history or source code:
+Create a free account at [NASA Earthdata Login](https://urs.earthdata.nasa.gov/),
+open your profile, and select **Generate Token**. Earthdata user tokens expire
+after **60 days**; replace the token before expiry. Earthdata currently permits
+at most two valid user tokens at a time. See the [official token-management
+guide](https://urs.earthdata.nasa.gov/documentation/for_users/user_token).
+
+The backend reads `EARTHDATA_TOKEN` from its process environment or the
+repository-root `.env` file. `.env` is ignored by Git and `.env.example`
+contains only an empty placeholder; `.env` is plain-text local configuration,
+not encrypted storage. Keep it restricted to your Windows account and never
+put credentials in frontend variables, source code, logs, screenshots, or API
+responses. The backend uses ASF's supported
+`asf_search.ASFSession.auth_with_token()` for NISAR data at ASF DAAC; the ASF
+search endpoint can return public metadata without proving protected-product
+access. `earthaccess` is not required for this ASF download path.
+
+To enter a token without putting it in PowerShell history, use a secure prompt
+in the same terminal that starts Uvicorn:
 
 ```powershell
-Set-Location D:\SAR-Sentinel-India
-if ([string]::IsNullOrWhiteSpace($env:EARTHDATA_TOKEN)) { throw "EARTHDATA_TOKEN is not set in this PowerShell process." }
-Set-Content -Path .env -Value "EARTHDATA_TOKEN=$env:EARTHDATA_TOKEN" -NoNewline
+$secureToken = Read-Host "Earthdata user token" -AsSecureString
+$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+try {
+    $env:EARTHDATA_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+    Set-Location 'D:\SAR-Sentinel-India\backend'
+    & '.\.venv\Scripts\python.exe' -m uvicorn app.main:app --reload
+}
+finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+    Remove-Variable secureToken, pointer -ErrorAction SilentlyContinue
+}
 ```
 
-Alternatively, export `$env:EARTHDATA_TOKEN` in the same PowerShell process before starting Uvicorn. Do not paste the token into chat or commit `.env`. `.env.example` contains only an empty placeholder.
+Alternatively, set `EARTHDATA_TOKEN` in your Windows user environment or the
+ignored repository-root `.env`. Restart the backend after changing it. The API
+reports `not_configured` for a missing token, `rejected` for a token Earthdata
+rejects as invalid/expired, `error` for an unavailable authentication or
+product endpoint, `token_valid` after Earthdata validates the token, and
+`data_access_verified` only after a protected product accepts a one-byte range
+request. A product-level denial can also mean the account lacks authorization
+for that data. Check Internet access and the system clock; generate a new
+token and replace the old value if rejected. No API response includes the
+token or authorization headers.
+
+Run the genuine, bounded authenticated-access check from PowerShell when a
+local token is configured. It searches ASF for the known NISAR GCOV product
+and requests only byte 0; it does not save product data or invoke the
+automatic acquisition workflow:
+
+```powershell
+Set-Location 'D:\SAR-Sentinel-India\backend'
+$env:SAR_EARTHDATA_LIVE_TEST = '1'
+try {
+    & '.\.venv\Scripts\python.exe' -m pytest tests\test_earthdata_live.py -q
+}
+finally {
+    Remove-Item Env:\SAR_EARTHDATA_LIVE_TEST -ErrorAction SilentlyContinue
+}
+```
+
+The test is skipped by default, so the regular test suite needs no credentials
+or network. Automatic catalog acquisition remains separately disabled by
+default; see the access guidance in
+[NISAR-CONNECTION-AUDIT.md](./data/NISAR-CONNECTION-AUDIT.md).
+
+### NISAR download and verification levels
+
+The download workflow stores partial transfers under the ignored
+`data/acquisitions/<river>/.nisar-download-<product-id>/` directory. A retry
+uses an HTTP byte range when ASF supports resumption. Credentials stay in the
+backend ASF session; signed URL query strings are not saved in the SQLite
+catalog, verification manifest, API response, or error messages. The completed
+HDF5 file and its verification manifest are finalized together by an atomic
+directory rename. Existing products are checked and reused rather than
+overwritten.
+
+The catalog and `download-verification.json` record the product/acquisition
+identifier and type, file size, sanitized source URL reference, download time,
+SHA-256, available provider-checksum algorithm/value, and separate status
+fields:
+
+- **Structure and identity verified** means required NISAR GCOV identification,
+  frequency-A HH/HV datasets, coordinates, polarization, and projection
+  metadata are consistent. This is not proof of provider origin by itself.
+- **Provider checksum verified** means a checksum returned in ASF metadata
+  matched the complete downloaded file. If ASF provides no usable checksum,
+  SHA-256 is recorded only as an integrity fingerprint; provider authenticity
+  remains unverified.
+- **Scientific validation not performed** remains the default. The separate
+  GCOV classifier is still an explicitly unvalidated candidate workflow.
+
+Normal mocked regression tests cover successful full-byte transfer, interruption
+and range resume, malformed/corrupt HDF5, inconsistent embedded product ID,
+provider checksum mismatch, absent provider checksum, and HTTP 401 credential
+failure. To run them:
+
+```powershell
+Set-Location 'D:\SAR-Sentinel-India'
+& '.\backend\.venv\Scripts\python.exe' -m pytest backend\tests\test_acquisitions.py backend\tests\test_nisar_gcov.py backend\tests\test_acquisition_jobs.py -q
+```
+
+An opt-in genuine full-download test is separate from the one-byte access
+test. Choose an ASF NISAR GCOV product whose catalogued file size is at most
+128 MiB (134,217,728 bytes), configure the backend token, and set its product
+ID; the test skips larger or unknown-size products before requesting product
+bytes. It saves the test product only in pytest's
+temporary directory and verifies the entire downloaded file, SHA-256, HDF5
+identity, and any provider checksum returned by ASF. It is skipped unless all
+opt-in settings are set:
+
+```powershell
+Set-Location 'D:\SAR-Sentinel-India\backend'
+$env:SAR_EARTHDATA_LIVE_DOWNLOAD_TEST = '1'
+$env:SAR_EARTHDATA_LIVE_DOWNLOAD_PRODUCT_ID = '<small GCOV product ID>'
+try {
+    & '.\.venv\Scripts\python.exe' -m pytest tests\test_earthdata_live.py -k full_download -q
+}
+finally {
+    Remove-Item Env:\SAR_EARTHDATA_LIVE_DOWNLOAD_TEST -ErrorAction SilentlyContinue
+    Remove-Item Env:\SAR_EARTHDATA_LIVE_DOWNLOAD_PRODUCT_ID -ErrorAction SilentlyContinue
+}
+```
+
+The finalization audit did not identify an eligible product: the two locally
+cached GCOV products are 6,811,549,696 and 6,618,611,712 bytes, and the
+authenticated pilot-area and bounded recent-catalog metadata searches
+returned no eligible sized product. This is not proof that ASF has no
+authorized smaller product outside those searches. Before running the command,
+select a currently authorized ASF GCOV product and confirm its metadata size
+is at most 134,217,728 bytes. No product ID or expected size is currently
+known, so do not substitute either cached product.
+
+Do not treat HDF5 structure, a self-calculated SHA-256, or this bounded test as
+independent scientific validation. Without a matching authoritative provider
+checksum, a structurally valid but spoofed file cannot be ruled out.
 
 ## Scientific limitations
 
@@ -223,6 +353,26 @@ Run backend tests from the repository root:
 
 Dashboard demonstration observations, charts, demo polygons, and metrics remain synthetic and illustrative. Automatic acquisition records come from real satellite product assets and are labeled separately. Their thresholded water masks are unvalidated candidates, not verified riverbanks, flood/damage findings, erosion/deposition, or scientifically validated measurements.
 
+## SAR and GIS teammate integration
+
+The backend exposes a typed, SQLite-persisted integration contract for
+verified local NISAR GCOV acquisitions, SAR processing jobs, registered
+outputs, GIS analysis jobs, results, and river associations. It does not
+implement teammate algorithms: jobs remain explicitly `blocked` until a SAR
+or GIS adapter is registered. Registration verifies actual GeoTIFF structure
+and declared CRS, dimensions, transform and NoData; GeoJSON is parsed and
+checked as a Feature or FeatureCollection, and GeoPackage metadata is checked.
+All outputs are path-checked and SHA-256 fingerprinted. Backend-generated
+provenance records source acquisition/output hashes and processing version;
+scientific validation remains `not_performed`.
+
+See the [team integration contract](./docs/TEAM_INTEGRATION_CONTRACT.md) for
+the API routes, adapter interfaces, metadata/CRS conventions, storage layout,
+offline test command, current limitations, and the inputs Apoorva and Sushanth
+need to provide. Demonstration regions cannot be associated with observation
+analysis. The latest genuine Earthdata evidence remains the earlier bounded
+one-byte access check; the full-product live test has not completed.
+
 ## Current milestone
 
 - **Milestone 2:** Initial interactive frontend with a simulated-data badge, selectable demonstration regions, map layers, and dashboard navigation.
@@ -234,6 +384,3 @@ Dashboard demonstration observations, charts, demo polygons, and metrics remain 
 - **Milestone 8:** Automatic NISAR metadata checks, authenticated GCOV acquisition, a separate windowed HH/HV processor with explicit no-valid-corridor-data handling, processing metadata/API, downloadable outputs, and NISAR-specific dashboard display are implemented. The Tungabhadra `A_009` scene produced an unvalidated candidate classification from valid corridor data; the `A_010` scene correctly returned no data. Sentinel-1 RTC acquisition and fallback remain intact.
 - **Milestone 9:** The A_009 candidate has HH-only/HV-only/combined comparisons, five equal-threshold-offset sensitivity cases, and 8-connected fragmentation diagnostics. Bounded Sentinel-2 pixels were inspected and used to create a NoData-preserving exploratory NDWI candidate raster. The dashboard can display that raster as an independent map layer with acquisition/coverage metadata and a candidate/non-candidate/NoData legend. It remains unvalidated and is not ground truth.
 - Existing demonstration overlays, charts, and metrics remain synthetic. Neither NISAR nor Sentinel-1 candidate masks have ground-truth validation. No verified riverbank boundaries, erosion/deposition, flood detection, or scientifically validated change detection is available.
-=======
-# SAR-Sentinel-India
->>>>>>> origin/main

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
+from app.redaction import redact_sensitive_text
 from app.schemas.acquisitions import AcquisitionJob, AcquisitionJobCreate
 from app.services import acquisitions
 from app.services.rivers import RIVER_CATALOG
@@ -237,11 +238,12 @@ def _safe_error(error: Exception) -> str:
         "Bearer [REDACTED]",
         str(error),
     )
-    return re.sub(
+    message = re.sub(
         r"(?i)(access_token|authorization|token|signature|sig)=([^&\s]+)",
         r"\1=[REDACTED]",
         message,
-    )[:2000]
+    )
+    return redact_sensitive_text(message)[:2000]
 
 
 def _run_nisar_download(job: AcquisitionJob) -> dict[str, str]:
@@ -255,8 +257,18 @@ def _run_nisar_download(job: AcquisitionJob) -> dict[str, str]:
         raise FileNotFoundError("The NISAR product is no longer present in the catalog.")
     session, authentication_error = acquisitions._earthdata_session()
     if session is None:
-        detail = f" ({authentication_error})" if authentication_error else ""
-        raise PermissionError(f"NASA Earthdata authentication is required for this download{detail}.")
+        raise PermissionError(
+            acquisitions._earthdata_authentication_message(authentication_error)
+        )
+    product.update(
+        acquisitions._search_nisar_product_by_id(job.product_id, session)
+    )
+    access_status, access_message = acquisitions._check_nisar_download(
+        product["_download_url"],
+        session=session,
+    )
+    if access_status != "authenticated_access_verified":
+        raise PermissionError(access_message)
     _update_job(
         job.job_id,
         status="downloading",

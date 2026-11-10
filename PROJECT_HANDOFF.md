@@ -4,6 +4,311 @@
 
 **Workspace:** `D:\SAR-Sentinel-India`
 
+## Finalization audit — current handoff status (2026-11-10)
+
+**Backend/acquisition/integration responsibilities: COMPLETE for this phase.**
+The integration boundary is implemented and offline-verified; remaining
+live-download, teammate-adapter, and independent-science items are explicit
+follow-ups, not claims of completed observation processing.
+
+### Status by evidence level
+
+1. **Implemented and tested:** Earthdata credentials remain backend-only;
+   acquisition/download recovery and verification are in place; persistent
+   SAR/GIS jobs, idempotency/retry, output registration, hashing, directory
+   confinement, server-derived provenance, redacted errors, and pilot-river
+   associations are covered by offline tests. Output registration parses
+   GeoTIFF/GeoJSON/GeoPackage/JSON content as applicable and checks raster
+   metadata against file contents. Results are forced to
+   `scientific_validation_status: not_performed`.
+2. **Genuine live satellite data:** an authenticated ASF one-byte range request
+   succeeded previously for a NISAR GCOV product. This did not verify a full
+   download or checksum.
+3. **Awaiting bounded live verification:** no eligible sized GCOV product was
+   identified by the bounded authenticated metadata searches. The two cached
+   products are 6,811,549,696 and 6,618,611,712 bytes, both above the
+   134,217,728-byte test cap. The searches do not establish that no eligible
+   product exists elsewhere in ASF. The README contains the opt-in command;
+   later select an authorized product under the cap, substitute its product
+   ID, and run it using the local `.env`. No token belongs in chat.
+4. **Awaiting Apoorva:** callable `process(ProcessingAdapterInput)`, real
+   outputs, supported roles, module version, and independent module tests.
+5. **Awaiting Sushanth:** callable `analyze(GISAdapterInput)`, spatial result
+   and metrics schemas, CRS/units conventions, module version, and module
+   tests consuming registered SAR outputs.
+6. **Awaiting scientific validation:** independent reference data, methodology,
+   and review. Current candidate outputs are not scientific findings.
+
+### Security and verification
+
+The `.env` file was not opened or printed; Git ignore rules cover `.env`,
+`data/*`, and `outputs/*`. No staged files were present. The literal-pattern
+scan found no credential values; its only potential match was the deliberate
+synthetic bearer string in a redaction test fixture. No live product bytes
+were downloaded during this audit.
+
+- Full backend: **202 passed, 3 skipped**, one existing Starlette/httpx
+  deprecation warning. Skips: two opt-in Earthdata live tests and the existing
+  Windows symlink-privilege test.
+- Acquisition/download and integration contract tests: **70 passed**, one
+  existing warning.
+- Frontend Playwright: **22 passed** using Microsoft Edge.
+- Frontend production build: passed; existing >500 kB chunk advisory remains.
+- Python compilation: passed; `pip check`: no broken requirements;
+  `git diff --check`: passed.
+
+Commands run:
+
+```powershell
+& '.\backend\.venv\Scripts\python.exe' -m pytest backend\tests -q -rs
+& '.\backend\.venv\Scripts\python.exe' -m pytest backend\tests\test_acquisitions.py backend\tests\test_nisar_gcov.py backend\tests\test_acquisition_jobs.py backend\tests\test_integration_contract.py -q
+& '.\backend\.venv\Scripts\python.exe' -m compileall -q backend\app backend\tests
+& '.\backend\.venv\Scripts\python.exe' -m pip check
+git diff --check
+Set-Location 'D:\SAR-Sentinel-India\frontend'
+$env:PLAYWRIGHT_CHANNEL = 'msedge'
+npm.cmd run test:e2e -- --reporter=line
+npm.cmd run build
+```
+
+### Handover boundary
+
+The backend lead can stop implementation now and hand over the contract.
+Resume only to wire/test teammate adapters, run a suitable bounded live
+download if an authorized product becomes available, or update the contract
+when scientific validation evidence is supplied. Do not claim a full live
+download, national monitoring, provider authenticity without provider evidence,
+or scientific validation.
+
+## SAR/GIS teammate integration — current checkpoint (2026-11-10)
+
+Added a typed integration boundary for Apoorva's SAR processor and Sushanth's
+GIS analysis without replacing the existing NISAR processor, Sentinel-1 path,
+NWIC explorer, or validation workflows. It uses the existing
+`data/satellite_catalog.sqlite3`; no second database was added.
+
+The new `/api/integration/acquisitions`, `/api/processing/jobs`, and
+`/api/gis/jobs` APIs list locally present, structure-checked NISAR acquisitions,
+retrieve recorded verification status, persist job submissions/status/retry
+lineage, register outputs, retrieve GIS results, and associate completed GIS
+jobs with a supported river. Submissions are request-fingerprint idempotent.
+The API rechecks acquisition structure/identity, output files are confined to
+`outputs/integration/<job_uuid>/`, and registered output bytes are fingerprinted
+with SHA-256 and rechecked before GIS consumption. Secrets and signed URLs in
+job configuration/results are rejected; adapter errors are redacted.
+
+No teammate module was present, so both adapters remain unregistered and jobs
+are explicitly persisted as `blocked` rather than producing fake results. A
+registered adapter or external process can populate files and register them
+through the job output endpoint. Output registration checks location, file
+presence, extension, size/hash, parses supported output formats, and checks
+raster CRS/dimensions/transform/NoData against declared metadata. It does not
+authenticate output origin or prove scientific validity. Backend-generated
+job provenance records source product/output hashes and processing version;
+scientific validation is explicitly `not_performed`.
+Current demo regions are rejected as observation targets; only existing pilot
+river IDs can be associated. A real region catalog is not available.
+
+Common contracts and minimal adapter examples are in
+[`docs/TEAM_INTEGRATION_CONTRACT.md`](./docs/TEAM_INTEGRATION_CONTRACT.md).
+The acquisition API's "verified" status means recorded structural/identity
+verification and locally-present file. A SHA-256 without a provider checksum
+remains an integrity fingerprint, not proof of provider origin. Scientific
+validation remains unperformed.
+
+The opt-in full-download test was not run. The two local NISAR products are
+6,811,549,696 and 6,618,611,712 bytes, both above the 128 MiB live-test cap.
+The existing genuine evidence remains an authenticated one-byte range check.
+Choose an eligible smaller catalogued product before running the documented
+live command; no token should be sent in chat.
+
+Changed files for this checkpoint: `backend/app/schemas/integration.py`,
+`backend/app/services/integration.py`, `backend/app/api/routes.py`,
+`backend/app/main.py`, `backend/tests/test_integration_contract.py`,
+`docs/TEAM_INTEGRATION_CONTRACT.md`, `README.md`, `PROJECT_PROGRESS.md`, and
+this handoff. No frontend files or pre-existing authentication/download
+changes were modified for this checkpoint.
+
+Verification:
+
+- Full backend `backend\.venv\Scripts\python.exe -m pytest backend\tests -q -rs`:
+  **200 passed, 3 skipped**, one existing Starlette/httpx deprecation warning.
+  Skips: both opt-in Earthdata live tests and the existing Windows symlink
+  privilege test.
+- Focused integration, acquisition-job and API tests:
+  **30 passed**, one existing Starlette/httpx deprecation warning.
+- Python `compileall` passed; `pip check` reported no broken requirements.
+- Frontend Playwright suite: **22 passed** using Microsoft Edge.
+- Frontend production build passed with the existing >500 kB chunk advisory.
+- Pylance reported no diagnostics in the new integration schema/service or
+  modified API/startup files.
+- The full-download live test was not run: cached NISAR files are
+  6,811,549,696 and 6,618,611,712 bytes, both above its 128 MiB limit.
+
+**Next exact actions:** Apoorva should provide a callable SAR adapter implementing
+`process(ProcessingAdapterInput)` and returning real output files plus metadata;
+Sushanth should provide a callable GIS adapter implementing
+`analyze(GISAdapterInput)` and returning spatial results/metrics and files.
+Register them with `configure_processing_adapters`, then run the offline
+integration tests with each real module. Separately identify an authorized ASF
+GCOV product catalogued at no more than 128 MiB and run the README's opt-in
+full-download test locally; do not send a token in chat. Do not claim a
+complete live download, national monitoring, or scientific validation before
+those criteria are independently met.
+
+## Secure Earthdata authentication — current checkpoint
+
+The existing backend already used `asf_search.ASFSession.auth_with_token()` for
+ASF downloads, so no duplicate auth client or `earthaccess` dependency was
+added. For this project's ASF-hosted NISAR products, the existing ASF client is
+the appropriate integration. Credentials are read only from backend process
+environment or the ignored repository-root `.env`; `.env.example` remains an
+empty placeholder. The token must be replaced before its 60-day Earthdata
+expiry. Automatic acquisition remains opt-in.
+
+Implementation:
+
+- Authentication outcomes distinguish missing configuration, rejected
+  credentials, other auth errors, token validation and protected-product
+  access. A catalog scan records the latest auth status/check time and last
+  successful search in SQLite; the additive API/dashboard fields report
+  recorded state rather than treating cached products or public metadata as
+  authenticated access.
+- ASF product access uses a bounded authenticated `Range: bytes=0-0` preflight.
+  Automatic and explicit NISAR downloads require that preflight to succeed.
+  Existing public catalog search and Sentinel-1 fallback remain separate.
+- Shared sanitization removes token/bearer assignments, authorization and
+  cookie values, signed URL parameters, configured token occurrences and
+  provider error text before logging or returning/persisting messages. Schema
+  validators also sanitize legacy/catalog URLs and response messages.
+- Tests cover missing/rejected/failed/successful authentication, range access,
+  status persistence and secret redaction. The live test is opt-in and uses a
+  real token; normal tests do not need credentials or network access.
+
+Genuine access proof: on 2026-11-10, the opt-in test authenticated with
+`asf_search.ASFSession.auth_with_token()`, queried the known A_009 NISAR GCOV
+product, then requested byte 0 from its protected ASF HTTPS URL. The request
+succeeded and the response was closed without reading or saving the body.
+This proves access to that product at test time only. It did not download a
+complete scene, verify a provider checksum, test all products/accounts, or
+invoke automatic acquisition.
+
+Verification results:
+
+- `backend\.venv\Scripts\python.exe -m pytest backend\tests -q`: **176 passed,
+  2 skipped**; one existing Starlette/httpx deprecation warning. The skips are
+  the opt-in live test (disabled by default) and an existing test that requires
+  Windows symlink privilege.
+- `backend\.venv\Scripts\python.exe -m pytest backend\tests\test_acquisitions.py backend\tests\test_nisar_connection_status.py -q`:
+  **37 passed**; one existing Starlette/httpx deprecation warning.
+- With a configured local token and `SAR_EARTHDATA_LIVE_TEST=1`,
+  `backend\.venv\Scripts\python.exe -m pytest backend\tests\test_earthdata_live.py -q`:
+  **1 passed** (real ASF/Earthdata access; no credentials printed).
+- From `frontend`, `$env:PLAYWRIGHT_CHANNEL='msedge'; npm.cmd run test:e2e -- --grep 'NISAR connection summary'`:
+  **2 passed** using mocked API responses. `npm.cmd run build` passed with an
+  existing large-chunk advisory.
+- `backend\.venv\Scripts\python.exe -m compileall -q backend\app backend\tests`
+  passed; `backend\.venv\Scripts\python.exe -m pip check` reported no broken
+  requirements.
+
+Files changed for this checkpoint: `backend/app/redaction.py`,
+`backend/app/services/acquisitions.py`,
+`backend/app/services/acquisition_jobs.py`, `backend/app/services/satellite.py`,
+`backend/app/schemas/acquisitions.py`, `backend/app/schemas/satellite.py`,
+`backend/tests/test_acquisitions.py`,
+`backend/tests/test_nisar_connection_status.py`,
+`backend/tests/test_earthdata_live.py`, `frontend/src/components/AutomaticAcquisitionPanel.jsx`,
+`frontend/tests/e2e/rivers.spec.js`, `pytest.ini`, `README.md`,
+`PROJECT_PROGRESS.md`, and this handoff. The local
+`data/NISAR-CONNECTION-AUDIT.md` also records the bounded live result; it is
+ignored by the repository's data-file rules.
+
+At this checkpoint, a complete authenticated download and checksum were
+unverified. The current download-verification checkpoint below supersedes that
+status. Full live download verification remains unrun unless separately
+confirmed there; no national dataset was downloaded.
+
+## Authenticated NISAR download and verification — current checkpoint
+
+Implemented a bounded, authenticated full-product download workflow using the
+existing ASF session and a fresh authenticated ASF granule lookup for explicit
+download jobs. Signed download URLs are transient: catalog records, response
+URLs, manifests, and error messages retain only the HTTPS source host/path
+reference, without any query string. The existing public discovery, automatic
+acquisition opt-in, Sentinel-1 fallback, river records, and GCOV candidate
+workflow remain in place.
+
+Download and recovery:
+
+- Transfers stream into ignored
+  `data/acquisitions/<river>/.nisar-download-<product-id>/` staging. Interrupted
+  transfers leave a `.part` file; subsequent requests use `Range` and validate
+  `Content-Range`. A server that ignores a range causes a safe restart from
+  byte zero. Network timeouts and provider failures return sanitized errors;
+  401/403 and redirects to Earthdata Login are reported as authentication
+  failures.
+- A per-product OS file lock serializes download workers. After a complete
+  transfer, byte size, checksums and HDF5 product metadata are checked before
+  the product and `download-verification.json` are published together by
+  atomic directory rename. A verified existing product is rechecked and
+  reused; it is not overwritten by an incomplete transfer. A fully verified
+  staged product left before final rename can be safely finalized on retry.
+- The manifest and catalog record the acquisition identifier, acquisition
+  times, product type, byte size, sanitized source URL reference, UTC download
+  timestamp, SHA-256, provider-checksum algorithm/value when advertised, and
+  separate integrity, structure, provider-authenticity and scientific status.
+
+Verification distinctions:
+
+- **Structure/identity verified:** required NISAR L2 GCOV identification
+  (`missionId`, `platformName`, `instrumentName`, level/type and exact
+  `granuleId`) matches the selected ASF product. Required frequency-A HH/HV
+  rasters, mask, coordinates, polarization, units, projection and regular
+  coordinate spacing are checked. The same validator is used by download and
+  GCOV processing.
+- **Provider checksum verified:** a SHA-256 or MD5 checksum provided by ASF
+  matches the complete file. SHA-256 is always calculated. If ASF has no
+  usable provider checksum, the SHA-256 is only a local integrity fingerprint;
+  it does not prove provider origin. HDF5 metadata can still be spoofed when no
+  authoritative checksum is available.
+- **Scientific validation:** remains `not_performed` by download. Existing
+  classification remains an explicitly unvalidated candidate workflow.
+
+Tests and verification:
+
+- Full backend command
+  `backend\.venv\Scripts\python.exe -m pytest backend\tests -q -rs`:
+  **187 passed, 3 skipped**, one existing Starlette/httpx warning. The skips
+  are the existing Windows symlink-privilege test and the two opt-in live tests
+  (one-byte and full download).
+- Focused mocked download, GCOV and job coverage: **55 passed, 2 skipped**.
+  Cases cover full stream, SHA/provider checksum match and mismatch, no
+  provider checksum, interrupted/resumed Range transfer, finalization recovery,
+  corrupt HDF5, inconsistent product ID, 401/403, login redirects, HTTP errors,
+  existing-file reuse, and signed-URL removal.
+- `backend\.venv\Scripts\python.exe -m compileall -q backend\app backend\tests`,
+  `backend\.venv\Scripts\python.exe -m pip check`, and `git diff --check`
+  passed. Pylance signature compatibility confirmed all four
+  `_inspect_nisar_hdf5` call sites match the new product-ID validation
+  parameter.
+- Focused NISAR connection Playwright tests: **2 passed**; frontend production
+  build passed with the existing large-chunk advisory.
+
+The genuine full-download test is present but **was not run**. It requires
+`SAR_EARTHDATA_LIVE_DOWNLOAD_TEST=1` and a user-selected
+`SAR_EARTHDATA_LIVE_DOWNLOAD_PRODUCT_ID`; it will only download a GCOV file
+catalogued at no more than 128 MiB and stores it in pytest temporary storage.
+See the exact PowerShell command in [README.md](./README.md). Therefore, no
+genuine complete-product download or live checksum match is claimed. No
+product or national dataset was downloaded during this implementation.
+
+Files for this checkpoint: `backend/app/services/nisar_product.py`,
+`backend/app/services/acquisitions.py`,
+`backend/app/services/acquisition_jobs.py`, `backend/app/services/nisar_gcov.py`,
+`backend/app/schemas/acquisitions.py`, `backend/tests/test_acquisitions.py`,
+`backend/tests/test_nisar_gcov.py`, `backend/tests/test_earthdata_live.py`,
+`pytest.ini`, `README.md`, `PROJECT_PROGRESS.md`, and this handoff.
+
 ## Source verification and snapshot review — current checkpoint
 
 The official [CWC CKAN record](https://nwdp.nwic.gov.in/api/3/action/package_show?id=river-line)
@@ -212,16 +517,19 @@ Live ASF search, local HDF5 metadata, a bounded source-to-output pixel check,
 real API and browser display corroborate an existing NISAR GCOV candidate.
 See [NISAR connection audit](./data/NISAR-CONNECTION-AUDIT.md) for product IDs,
 sizes, caveats, exact scope and outstanding evidence. No satellite product was
-downloaded or reprocessed. Authenticated access and checksums remain unverified.
-Catalog recovery can overwrite search status and the HDF5 checker can accept
-spoofed structures; do not treat it as authenticated provenance.
+downloaded or reprocessed. At the time of this earlier checkpoint,
+authenticated access was unverified; the current one-byte result is recorded
+above. Checksums remain unverified. Catalog recovery can overwrite search
+status and the HDF5 checker can accept spoofed structures; do not treat it as
+authenticated provenance.
 
-The API now includes a conservative catalog-derived NISAR connection summary,
-also shown in the dashboard. It does not record live connectivity, authentication,
-successful search timestamps, full match totals or precise last errors; those
-remain unknown or unavailable. Counts are catalog claims, including no-data
-processing results. Next: persist sanitized per-attempt evidence, verify
-authenticity and checksum, and test genuine retrieval and synthetic rejection.
+The initial API connection summary did not record live connectivity,
+authentication, successful search timestamps, full match totals or precise
+last errors. The current implementation now persists latest authentication
+status/check time and last successful search; it does not retain historical
+attempts or full match totals. Counts remain catalog claims, including no-data
+processing results. Next: verify product authenticity/checksum and test
+synthetic-product rejection.
 
 Prior interrupted work added time-separation provenance to validation results
 and dashboard without changing scientific eligibility. Checklist remains 64/69

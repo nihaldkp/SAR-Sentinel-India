@@ -9,18 +9,34 @@ import pytest
 from app.services import nisar_gcov
 from app.schemas.acquisitions import NisarProcessingResult
 
+TEST_PRODUCT_ID = "NISAR_L2_UR_GCOV_TEST_001"
+
 
 def _write_gcov_fixture(
     path: Path,
     *,
     include_hv: bool = True,
     valid_data: bool = True,
+    product_id: str = TEST_PRODUCT_ID,
 ) -> None:
     h5py = pytest.importorskip("h5py")
     height = width = 32
     x_coordinates = 500_005 + np.arange(width, dtype=np.float64) * 10
     y_coordinates = 4_500_155 - np.arange(height, dtype=np.float64) * 10
     with h5py.File(path, "w") as dataset:
+        dataset.attrs["mission_name"] = "NISAR"
+        dataset.attrs["title"] = "NISAR L2 GCOV Product"
+        identification = dataset.create_group("science/LSAR/identification")
+        for field, value in {
+            "missionId": "NISAR",
+            "platformName": "NISAR",
+            "instrumentName": "LSAR",
+            "productLevel": "L2",
+            "productType": "GCOV",
+            "granuleId": product_id,
+        }.items():
+            identification.create_dataset(field, data=np.bytes_(value))
+        identification.create_dataset("listOfFrequencies", data=np.asarray([b"A"], dtype="S1"))
         grid = dataset.create_group("science/LSAR/GCOV/grids/frequencyA")
         projection = grid.create_dataset("projection", data=np.uint32(32643))
         projection.attrs["epsg_code"] = np.uint32(32643)
@@ -84,7 +100,7 @@ def test_process_small_gcov_fixture_preserves_georeferencing_and_nodata(
 
     result = nisar_gcov.process_gcov_product(
         source_path,
-        "NISAR_TEST",
+        TEST_PRODUCT_ID,
         "test-river",
         tmp_path / "processing",
     )
@@ -298,7 +314,7 @@ def test_gcov_processor_rejects_missing_hv_dataset(
     with pytest.raises(ValueError, match="missing required frequency-A datasets"):
         nisar_gcov.process_gcov_product(
             source_path,
-            "NISAR_TEST",
+            TEST_PRODUCT_ID,
             "test-river",
             tmp_path / "processing",
         )
@@ -315,7 +331,7 @@ def test_gcov_processor_rejects_river_outside_product_extent(
     with pytest.raises(ValueError, match="Unsupported river_id"):
         nisar_gcov.process_gcov_product(
             source_path,
-            "NISAR_TEST",
+            TEST_PRODUCT_ID,
             "missing-river",
             tmp_path / "processing",
         )
@@ -332,7 +348,7 @@ def test_gcov_processor_reports_no_data_without_fabricating_a_mask(
 
     result = nisar_gcov.process_gcov_product(
         source_path,
-        "NISAR_TEST",
+        TEST_PRODUCT_ID,
         "test-river",
         output_directory,
     )

@@ -6,6 +6,76 @@
 
 **Verified checklist completion:** 64 of 69 items (92.8%). This counts checked deliverables only and does not indicate scientific validation or overall product readiness.
 
+## 2026-11-10 — backend/acquisition/integration finalization
+
+The backend responsibility for this phase is complete and handed over. SAR/GIS
+contracts remain adapter interfaces; no teammate algorithm or scientific
+result was fabricated. Output registration now validates actual supported
+file formats (GeoTIFF, GeoJSON, GeoPackage, and JSON), checks raster geospatial
+metadata against the file, records backend-derived source/output provenance,
+and forces scientific validation to `not_performed`. GIS inputs remain
+registered outputs from completed SAR jobs, and pilot-river associations are
+preserved.
+
+Security audit: `.env` was not read; `.env`, downloaded data, the SQLite
+catalog, and integration outputs are ignored by Git. No files were staged. A
+credential-pattern scan found only the synthetic bearer value deliberately
+used by the redaction test. Output and data directories are path-confined.
+
+Full backend tests: **202 passed, 3 skipped** (the two opt-in live Earthdata
+tests and one Windows symlink-privilege test), with one existing
+Starlette/httpx warning. Focused acquisition/download/integration tests:
+**70 passed** with the same warning. Frontend Playwright: **22 passed**;
+production build passed with the existing large-chunk advisory. Python
+compilation and `git diff --check` passed; `pip check` reported no broken
+requirements.
+
+The only genuine live satellite evidence remains a prior authenticated
+one-byte ASF range request. No eligible <=128 MiB GCOV product was identified
+by the bounded authenticated metadata searches; this does not establish that
+none exists elsewhere in ASF. The two cached products (6,811,549,696 and
+6,618,611,712 bytes) are over the cap. No product bytes were downloaded.
+
+Handover: Apoorva owes `process(ProcessingAdapterInput)` and real output
+fixtures/tests; Sushanth owes `analyze(GISAdapterInput)`, result/metrics and
+CRS/units contracts, and tests consuming SAR outputs. Independent scientific
+validation remains unperformed. See [handoff](./PROJECT_HANDOFF.md) and
+[team integration contract](./docs/TEAM_INTEGRATION_CONTRACT.md) for the exact
+next actions and bounded live-test command.
+
+## 2026-11-10 — SAR/GIS integration contracts (partial)
+
+Added typed, paginated APIs for locally present structure-checked NISAR
+acquisitions, processing/GIS jobs, output registration, result retrieval and
+river associations. Job and output metadata use the existing satellite SQLite
+catalog; output files are confined to per-job directories under
+`outputs/integration/`, SHA-256 fingerprinted, and rechecked before GIS use.
+Duplicate submissions are idempotent; blocked/failed jobs remain persistent
+and retryable. Startup marks interrupted integration jobs failed with a
+recoverable status.
+
+The SAR/GIS adapter protocols are implemented, but Apoorva's and Sushanth's
+modules are not present or registered. Jobs therefore remain `blocked` and
+generate no substitute results. Demo regions are rejected; real region
+association awaits a non-demonstration region catalog. Output bytes and
+declared raster metadata are checked against parsed formats; these checks do
+not authenticate output origin or provide scientific validation. See
+[team integration contract](./docs/TEAM_INTEGRATION_CONTRACT.md).
+
+Verification: full backend suite **200 passed, 3 skipped** (the two opt-in
+Earthdata tests and the existing Windows symlink-privilege test), with one
+existing Starlette/httpx warning. Focused integration/API/acquisition-job tests
+**30 passed**. Python compilation and `pip check` passed; Pylance reported no
+diagnostics for changed Python files. Frontend Playwright: **22 passed**;
+production build passed with the existing large-chunk advisory.
+
+No new live download was attempted: both cached products (6,811,549,696 and
+6,618,611,712 bytes) exceed the 128 MiB opt-in full-download limit. The earlier
+real one-byte authentication test remains the only live Earthdata evidence.
+Full-file verification, teammate adapters, a non-demonstration region
+catalogue, and independent scientific validation remain incomplete. Exact
+next actions and adapter signatures are in [handoff](./PROJECT_HANDOFF.md).
+
 ## Source verification and snapshot review — partial
 
 CWC metadata and the general NWIC copyright policy were checked; release
@@ -54,13 +124,77 @@ incomplete; see [handoff](./PROJECT_HANDOFF.md) for phase 1 continuation.
 ## Latest continuation — NISAR connection audit
 
 Existing A_009 NISAR GCOV candidate is visible on the real dashboard; provider
-search and a bounded HDF5-to-output comparison corroborate provenance. File
-checksum, fresh authenticated retrieval and independent accuracy remain
-unverified. A catalog-derived diagnostic explicitly reports unknown live
-connectivity/authentication rather than inferring success from cached files.
-See [audit](./data/NISAR-CONNECTION-AUDIT.md). Backend 159 passed/1 skipped;
-focused validation 41 passed/1 skipped; mocked Playwright 18 passed; build
-passed. The prior temporal-separation display adds provenance, not validation.
+search and a bounded HDF5-to-output comparison corroborate provenance. At this
+checkpoint, authenticated retrieval and file checksum were unverified. The
+subsequent authentication work below verified one-byte access to A_009; no
+complete file or checksum was obtained. Independent accuracy remains
+unverified. See [audit](./data/NISAR-CONNECTION-AUDIT.md). The prior
+temporal-separation display adds provenance, not validation.
+
+## Latest continuation — secure Earthdata authentication (2026-11-10)
+
+Audited the existing ASF `asf_search.ASFSession.auth_with_token()` integration;
+it is the supported path for this project's ASF-hosted NISAR products, so no
+`earthaccess` dependency was added. Authentication reads only `EARTHDATA_TOKEN`
+from the backend environment or ignored root `.env`; `.env.example` remains a
+placeholder and `.env` remains Git-ignored. Added clear missing/rejected/error
+states, bounded protected-product access verification, persisted auth/search
+status and check times, and a download preflight. Responses, provider errors,
+job messages and logs redact credentials, authorization/cookie values and
+credential-bearing URLs. The UI distinguishes recorded status from cached
+product counts.
+
+The genuine opt-in test used the configured token, ASF metadata for the known
+A_009 GCOV product, and an authenticated `Range: bytes=0-0` request. It passed
+without reading or saving the product body. This proves access to that product
+at test time only; it is not a full download, checksum, universal NISAR access
+proof, or scientific validation. No product was downloaded in this work and
+automatic acquisition remains disabled by default.
+
+Verification: full backend suite **176 passed, 2 skipped** (one existing
+Starlette/httpx deprecation warning); focused auth/status tests **37 passed**;
+genuine live access test **1 passed**; relevant mocked Playwright tests
+**2 passed**; frontend production build passed with the existing large-chunk
+advisory. The full-suite skips are the opt-in live test (disabled by default)
+and an existing Windows symlink-privilege test. Python compilation passed and
+`pip check` reported no broken requirements. Missing, rejected, failed and
+successful authentication, status persistence and secret redaction are
+covered offline without committed credentials. Remaining limitations include
+no full-file integrity/checksum, synthetic-product rejection, broad
+product/account authorization proof or scientific validation. See
+[handoff](./PROJECT_HANDOFF.md) and the [audit](./data/NISAR-CONNECTION-AUDIT.md).
+
+## Latest continuation — authenticated NISAR download verification (2026-11-10)
+
+Added authenticated streamed downloads with resumable HTTP Range transfers,
+safe interruption/retry behavior, login/HTTP error handling, per-product OS
+locking and atomic finalization of the HDF5 file plus verification manifest.
+Downloads are staged under ignored `data/acquisitions/`; verified existing
+files are reused rather than overwritten. Explicit download jobs re-query ASF
+for fresh metadata so signed URLs need not be persisted. Catalog and manifest
+records include acquisition identifier/times, product type, file size,
+query-free source reference, download timestamp, full-file SHA-256 and any
+available ASF provider checksum.
+
+Shared GCOV validation checks the exact HDF5 `granuleId` against the requested
+ASF product, NISAR/LSAR/L2/GCOV metadata, frequency-A HH/HV rasters, mask,
+polarizations, units, coordinates, spacing and projection. Status distinguishes
+structure/identity verification, provider-checksum verification, SHA-only
+fingerprinting where no provider checksum exists, and scientific validation
+(still not performed). This does not prove provider authenticity without an
+authoritative checksum; metadata can be spoofed.
+
+Verification: full backend suite **187 passed, 3 skipped** (two opt-in live
+tests and one Windows symlink privilege test), one existing Starlette/httpx
+warning. Focused download/GCOV/job tests **55 passed, 2 skipped**. Python
+compilation, `pip check`, `git diff --check`, and four-call-site Pylance
+signature compatibility passed. NISAR connection Playwright tests **2 passed**;
+frontend build passed with the existing large-chunk advisory.
+
+The full authenticated download test is implemented but **not run**: it needs
+a user-selected GCOV product ID of at most 128 MiB. No genuine complete
+product download or live checksum match is claimed, and no product or national
+dataset was downloaded. Exact PowerShell instructions are in [README.md](./README.md).
 
 ## Latest continuation — national coverage not yet available
 

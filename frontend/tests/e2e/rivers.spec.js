@@ -1343,6 +1343,10 @@ test("NISAR connection summary distinguishes cached records from live verificati
       enabled: false,
       rivers: [acquisitionRiver("kaveri")],
       nisar_connection_status: {
+        provider_connectivity: "unknown",
+        authentication_status: "unknown",
+        authentication_checked_at: null,
+        last_successful_search: null,
         cached_product_count: 2,
         recorded_download_count: 1,
         recorded_inspection_count: 1,
@@ -1357,8 +1361,37 @@ test("NISAR connection summary distinguishes cached records from live verificati
   await page.reload();
   const summary = page.getByRole("region", { name: "NISAR Data Connection Status" });
   await expect(summary.getByText(/Current connectivity: unknown/)).toBeVisible();
+  await expect(summary.getByText(/Authentication: unknown/)).toBeVisible();
   await expect(summary.getByText(/Catalog-reported unique products: 2/)).toBeVisible();
   await expect(summary.getByText(/example-gcov/)).toBeVisible();
   await expect(summary.getByText(/A catalog or processing error is recorded/)).toBeVisible();
-  await expect(summary.getByText(/not a live provider check/)).toBeVisible();
+  await expect(summary.getByText(/cached product counts do not verify checksums/)).toBeVisible();
+});
+
+test("NISAR connection summary displays recorded authenticated product access", async ({ page }) => {
+  await page.route("**/api/acquisitions", async (route) => {
+    await route.fulfill({ json: {
+      enabled: false,
+      rivers: [acquisitionRiver("tungabhadra")],
+      nisar_connection_status: {
+        provider_connectivity: "available",
+        authentication_status: "data_access_verified",
+        authentication_checked_at: "2026-11-10T12:00:00Z",
+        last_successful_search: "2026-11-10T11:59:59Z",
+        cached_product_count: 1,
+        recorded_download_count: 0,
+        recorded_inspection_count: 0,
+        recorded_processing_count: 0,
+        latest_recorded_inspection_product_id: null,
+        latest_recorded_inspection_acquisition: null,
+        latest_recorded_processing: null,
+        recorded_error: false,
+      },
+    } });
+  });
+  await page.reload();
+  const summary = page.getByRole("region", { name: "NISAR Data Connection Status" });
+  await expect(summary.getByText(/available at last successful search/)).toBeVisible();
+  await expect(summary.getByText(/product access verified by one-byte request/)).toBeVisible();
+  await expect(summary.getByText(/10 Nov 2026/).first()).toBeVisible();
 });

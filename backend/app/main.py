@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.services.acquisitions import automatic_acquisition_enabled, automatic_refresh_loop
 from app.services.acquisition_jobs import recover_interrupted_jobs
+from app.services.integration import recover_interrupted_jobs as recover_interrupted_integration_jobs
 from app.api.routes import router
 
 LOGGER = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ LOGGER = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     recover_interrupted_jobs()
+    recover_interrupted_integration_jobs()
     task = None
     if automatic_acquisition_enabled():
         task = asyncio.create_task(automatic_refresh_loop(), name="satellite-acquisition")

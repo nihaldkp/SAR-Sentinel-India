@@ -6,19 +6,19 @@ import os
 import re
 import shutil
 import sqlite3
-import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Iterator
-from urllib.parse import quote, urlparse
+from typing import Any, Callable, Generator, Iterator
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import httpx
 import numpy as np
 from dotenv import load_dotenv
 
+from app.redaction import redact_sensitive_text
 from app.schemas.acquisitions import (
     AcquisitionIssue,
     AcquiredObservation,
@@ -29,6 +29,11 @@ from app.schemas.acquisitions import (
 from app.schemas.analysis import WaterMaskRequest
 from app.services import analysis
 from app.services.optical_reference import create_candidate_preview
+from app.services.nisar_product import (
+    NISAR_PRODUCT_ID,
+    calculate_checksums,
+    validate_nisar_gcov_hdf5,
+)
 from app.services.rivers import RIVER_CATALOG
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +50,7 @@ CORRIDOR_HALF_WIDTH_M = 1_500
 ANALYSIS_WINDOW_SIZE_M = 12_000
 MAX_ANALYSIS_PIXELS = 2_000_000
 NISAR_DOWNLOAD_RESERVE_BYTES = 1_000_000_000
+NISAR_DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 ACQUISITION_ROOT = REPOSITORY_ROOT / "data" / "acquisitions"
 CATALOG_PATH = REPOSITORY_ROOT / "data" / "satellite_catalog.sqlite3"
 
@@ -101,6 +107,9 @@ def _database() -> sqlite3.Connection:
             nisar_acquisition_start TEXT,
             nisar_message TEXT,
             nisar_products_json TEXT NOT NULL DEFAULT '[]',
+            nisar_authentication_status TEXT NOT NULL DEFAULT 'unknown',
+            nisar_authentication_checked_at TEXT,
+            nisar_last_successful_search TEXT,
             candidate_count INTEGER NOT NULL DEFAULT 0,
             message TEXT
         )
@@ -113,6 +122,13 @@ def _database() -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE river_scans ADD COLUMN nisar_products_json TEXT NOT NULL DEFAULT '[]'"
         )
+    for column, definition in (
+        ("nisar_authentication_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("nisar_authentication_checked_at", "TEXT"),
+        ("nisar_last_successful_search", "TEXT"),
+    ):
+        if column not in scan_columns:
+            connection.execute(f"ALTER TABLE river_scans ADD COLUMN {column} {definition}")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS acquired_products (
@@ -397,16 +413,40 @@ def _search_nisar(river_id: str, session: Any | None = None) -> list[dict[str, A
 def _earthdata_session() -> tuple[Any | None, str | None]:
     token = os.getenv("EARTHDATA_TOKEN", "").strip()
     if not token:
-        return None, None
+        return None, "not_configured"
     try:
         asf = import_module("asf_search")
         return asf.ASFSession().auth_with_token(token), None
     except Exception as error:
-        LOGGER.warning(
-            "Earthdata token authentication failed (%s); continuing with unauthenticated NISAR metadata and Sentinel-1 fallback.",
-            type(error).__name__,
+        auth_error = (
+            "rejected"
+            if type(error).__name__ == "ASFAuthenticationError"
+            else "error"
         )
-        return None, type(error).__name__
+        LOGGER.warning(
+            "Earthdata token validation failed (%s); continuing with unauthenticated NISAR metadata and Sentinel-1 fallback.",
+            auth_error,
+        )
+        return None, auth_error
+
+
+def _earthdata_authentication_message(authentication_error: str | None) -> str:
+    if authentication_error == "not_configured":
+        return (
+            "EARTHDATA_TOKEN is not configured. Generate an Earthdata Login user token "
+            "and set it in the backend environment."
+        )
+    if authentication_error == "rejected":
+        return (
+            "NASA Earthdata rejected the token as invalid or expired. Generate a replacement "
+            "Earthdata Login user token."
+        )
+    if authentication_error == "error":
+        return (
+            "NASA Earthdata could not validate the token because the authentication service "
+            "or network request failed; check connectivity and retry."
+        )
+    return "NASA Earthdata authentication is required for this product."
 
 
 def _nisar_size_bytes(
@@ -424,14 +464,49 @@ def _nisar_size_bytes(
                 product_size = product_asset.get("bytes")
                 if isinstance(product_size, int) and product_size >= 0:
                     return product_size
-        byte_values = [
-            item.get("bytes")
-            for item in sizes.values()
-            if isinstance(item, dict) and isinstance(item.get("bytes"), int)
-        ]
-        if byte_values:
-            return sum(value for value in byte_values if value >= 0)
     return None
+
+
+def _source_url_reference(value: str) -> str:
+    parts = urlsplit(value)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _provider_checksum(properties: dict[str, Any]) -> tuple[str | None, str | None]:
+    candidates: list[tuple[str, Any]] = []
+    for key, algorithm in (
+        ("sha256", "sha256"),
+        ("sha256sum", "sha256"),
+        ("sha256Checksum", "sha256"),
+        ("md5", "md5"),
+        ("md5sum", "md5"),
+        ("md5Checksum", "md5"),
+    ):
+        if key in properties:
+            candidates.append((algorithm, properties[key]))
+    nested = properties.get("checksum")
+    if isinstance(nested, dict):
+        algorithm = str(nested.get("algorithm", "")).casefold().replace("-", "")
+        value = nested.get("value")
+        if algorithm in {"sha256", "md5"}:
+            candidates.append((algorithm, value))
+    elif isinstance(nested, str):
+        match = re.fullmatch(r"(?i)(sha-?256|md5):([0-9a-f]+)", nested.strip())
+        if match:
+            candidates.append((match.group(1).casefold().replace("-", ""), match.group(2)))
+    if not candidates:
+        return None, None
+    algorithm, value = candidates[0]
+    normalized = str(value).strip().casefold()
+    expected_length = 64 if algorithm == "sha256" else 32
+    if len(normalized) != expected_length or not re.fullmatch(r"[0-9a-f]+", normalized):
+        raise ValueError("ASF supplied a malformed provider checksum.")
+    if any(
+        other_algorithm != algorithm or str(other_value).strip().casefold() != normalized
+        for other_algorithm, other_value in candidates[1:]
+    ):
+        raise ValueError("ASF supplied conflicting provider checksums.")
+    return algorithm, normalized
 
 
 def _nisar_product_metadata(feature: dict[str, Any], authenticated: bool) -> dict[str, Any] | None:
@@ -452,20 +527,95 @@ def _nisar_product_metadata(feature: dict[str, Any], authenticated: bool) -> dic
         polarization = [value for value in polarization if isinstance(value, str)]
     else:
         polarization = None
+    checksum_algorithm, checksum_value = _provider_checksum(properties)
     return {
         "product_id": product_id,
         "acquisition_start": start.isoformat() if start else None,
         "acquisition_end": end.isoformat() if end else None,
         "product_level": str(product_level),
+        "product_type": "GCOV",
         "polarization": polarization,
         "size_bytes": _nisar_size_bytes(properties, product_url),
         "availability": "authenticated_catalog" if authenticated else "authentication_required",
         "download_status": "not_attempted",
-        "source_url": product_url,
+        "source_url": _source_url_reference(product_url),
+        "_download_url": product_url,
+        "provider_checksum_algorithm": checksum_algorithm,
+        "provider_checksum": checksum_value,
         "local_path": None,
         "hdf5_groups": [],
         "message": None,
     }
+
+
+def _search_nisar_product_by_id(product_id: str, session: Any) -> dict[str, Any]:
+    try:
+        asf = import_module("asf_search")
+        results = asf.granule_search(
+            [product_id],
+            opts=asf.ASFSearchOptions(session=session),
+        )
+        if hasattr(results, "raise_if_incomplete"):
+            results.raise_if_incomplete()
+        for result in results:
+            feature = result.geojson()
+            if not isinstance(feature, dict):
+                continue
+            product = _nisar_product_metadata(feature, authenticated=True)
+            if product and product["product_id"] == product_id:
+                return product
+    except Exception as error:
+        raise RuntimeError(
+            f"ASF product metadata lookup failed ({type(error).__name__}); provider details were omitted."
+        ) from None
+    raise FileNotFoundError("ASF did not return the requested NISAR product metadata.")
+
+
+def _record_verified_nisar_product(
+    product: dict[str, Any],
+    path: Path,
+    product_url: str,
+    groups: list[str],
+    polarizations: list[str],
+    checksums: dict[str, str],
+    manifest: dict[str, Any],
+    provider_verified: bool,
+    reused: bool = False,
+) -> dict[str, Any]:
+    checksum_algorithm = (
+        product.get("provider_checksum_algorithm")
+        or manifest.get("provider_checksum_algorithm")
+    )
+    checksum_value = product.get("provider_checksum") or manifest.get("provider_checksum")
+    product.update(
+        {
+            "download_status": "downloaded",
+            "availability": "downloaded_verified",
+            "local_path": str(path.relative_to(REPOSITORY_ROOT)),
+            "acquisition_identifier": product["product_id"],
+            "size_bytes": path.stat().st_size,
+            "product_type": "GCOV",
+            "hdf5_groups": groups,
+            "polarization": polarizations,
+            "sha256": checksums["sha256"],
+            "provider_checksum_algorithm": checksum_algorithm,
+            "provider_checksum": checksum_value,
+            "integrity_status": (
+                "provider_checksum_verified"
+                if provider_verified
+                else "sha256_fingerprint_only"
+            ),
+            "structure_verification_status": "verified",
+            "provider_authenticity_status": (
+                "provider_checksum_verified" if provider_verified else "not_verified"
+            ),
+            "scientific_validation_status": "not_performed",
+            "download_timestamp": manifest.get("download_timestamp"),
+            "source_url_reference": _source_url_reference(product_url),
+            "message": _verification_message(provider_verified, reused=reused),
+        }
+    )
+    return product
 
 
 def _download_nisar_product(
@@ -474,71 +624,364 @@ def _download_nisar_product(
     session: Any,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    product_url = product["source_url"]
+    product_url = product.get("_download_url") or product["source_url"]
     parsed_url = urlparse(product_url)
-    if parsed_url.scheme != "https" or not (
-        parsed_url.hostname == "asf.earthdatacloud.nasa.gov"
-        or (parsed_url.hostname or "").endswith(".asf.earthdatacloud.nasa.gov")
-    ):
+    if river_id not in {river.id for river in RIVER_CATALOG}:
+        raise ValueError("Unsupported river_id for NISAR product download.")
+    if not NISAR_PRODUCT_ID.fullmatch(product["product_id"]):
+        raise ValueError("ASF returned an invalid NISAR GCOV product identifier.")
+    if not _is_approved_nisar_url(product_url):
         raise ValueError("ASF returned a NISAR URL outside the approved ASF Earthdata Cloud host.")
     product_name = Path(parsed_url.path).name
     if not product_name or product_name in {".", ".."}:
         raise ValueError("ASF returned a NISAR product URL without a valid file name.")
-    product_directory = ACQUISITION_ROOT / river_id / _safe_product_id(product["product_id"])
-    product_directory.mkdir(parents=True, exist_ok=True)
+    river_directory = ACQUISITION_ROOT / river_id
+    river_directory.mkdir(parents=True, exist_ok=True)
+    safe_product_id = _safe_product_id(product["product_id"])
+    product_directory = river_directory / safe_product_id
+    staging_directory = river_directory / f".nisar-download-{safe_product_id}"
     final_path = product_directory / product_name
     expected_size = product.get("size_bytes")
-    with _NISAR_DOWNLOAD_LOCK:
-        if final_path.is_file():
+    checksum_algorithm = product.get("provider_checksum_algorithm")
+    checksum_value = product.get("provider_checksum")
+    lock_path = river_directory / f".{safe_product_id}.download.lock"
+    with _NISAR_DOWNLOAD_LOCK, _exclusive_product_download_lock(lock_path):
+        if product_directory.exists():
+            if not final_path.is_file():
+                raise FileExistsError("A local NISAR product directory already exists; refusing to replace it.")
             if progress_callback is not None:
-                progress_callback("Validating existing NISAR HDF5 product")
-            groups, polarizations = _inspect_nisar_hdf5(final_path, expected_size)
-        else:
-            required_bytes = (expected_size or 0) + NISAR_DOWNLOAD_RESERVE_BYTES
-            if shutil.disk_usage(product_directory).free < required_bytes:
-                product["download_status"] = "insufficient_disk_space"
-                product["message"] = (
-                    "Download not attempted: the product requires approximately "
-                    f"{expected_size or 'unknown'} bytes plus a 1 GB safety reserve."
-                )
-                return product
-            staging_directory = Path(
-                tempfile.mkdtemp(prefix=".nisar-download-", dir=product_directory)
+                progress_callback("Verifying existing NISAR product")
+            groups, polarizations = _inspect_nisar_hdf5(
+                final_path, expected_size, product["product_id"]
             )
-            try:
-                asf = import_module("asf_search")
-                asf.download_urls(urls=[product_url], path=str(staging_directory), session=session)
-                expected_size = product.get("size_bytes")
-                staged_path = staging_directory / product_name
-                if not staged_path.is_file() or staged_path.stat().st_size == 0:
-                    raise ValueError("ASF download completed without a non-empty NISAR product file.")
-                if progress_callback is not None:
-                    progress_callback("Verifying downloaded file size and HDF5 structure")
-                groups, polarizations = _inspect_nisar_hdf5(staged_path, expected_size)
-                if final_path.exists():
-                    raise FileExistsError(
-                        "A product file appeared during download; refusing to overwrite it."
-                    )
-                os.replace(staged_path, final_path)
-            finally:
-                shutil.rmtree(staging_directory, ignore_errors=True)
-        product["download_status"] = "downloaded"
+            calculated = calculate_checksums(
+                final_path,
+                include_md5=(
+                    checksum_algorithm == "md5"
+                    or (product_directory / "download-verification.json").is_file()
+                ),
+            )
+            if checksum_value and calculated[checksum_algorithm] != checksum_value:
+                raise ValueError("The existing NISAR product does not match the ASF provider checksum.")
+            manifest_path = product_directory / "download-verification.json"
+            manifest: dict[str, Any] = {}
+            if manifest_path.is_file():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    manifest = {}
+                if (
+                    manifest.get("product_id") != product["product_id"]
+                    or manifest.get("sha256") != calculated["sha256"]
+                    or manifest.get("file_size_bytes") != final_path.stat().st_size
+                ):
+                    raise ValueError("The existing NISAR verification record does not match the product.")
+            manifest_algorithm = manifest.get("provider_checksum_algorithm")
+            manifest_checksum = manifest.get("provider_checksum")
+            if manifest_checksum:
+                if manifest_algorithm not in {"sha256", "md5"}:
+                    raise ValueError("The existing NISAR verification record has an invalid checksum algorithm.")
+                if calculated[manifest_algorithm] != manifest_checksum:
+                    raise ValueError("The existing NISAR product does not match its recorded provider checksum.")
+            provider_verified = bool(checksum_value or manifest_checksum)
+            return _record_verified_nisar_product(
+                product,
+                final_path,
+                product_url,
+                groups,
+                polarizations,
+                calculated,
+                manifest,
+                provider_verified,
+                reused=True,
+            )
 
-    product["availability"] = "downloaded_verified"
-    product["local_path"] = str(final_path.relative_to(REPOSITORY_ROOT))
-    product["hdf5_groups"] = groups
-    if polarizations:
-        product["polarization"] = polarizations
-    product["message"] = (
-        "Downloaded through ASF's authenticated client and opened successfully with h5py. "
-        "Processing is available separately for supported frequency-A HH/HV GCOV inputs."
+        staging_directory.mkdir(exist_ok=True)
+        staged_path = staging_directory / f"{product_name}.part"
+        staged_product_path = staging_directory / product_name
+        staged_manifest_path = staging_directory / "download-verification.json"
+        required_bytes = (expected_size or 0) + NISAR_DOWNLOAD_RESERVE_BYTES
+        if shutil.disk_usage(river_directory).free < required_bytes:
+            product["download_status"] = "insufficient_disk_space"
+            product["message"] = (
+                "Download not attempted: the product requires approximately "
+                f"{expected_size or 'unknown'} bytes plus a 1 GB safety reserve."
+            )
+            return product
+        if staged_product_path.is_file() and staged_manifest_path.is_file():
+            try:
+                manifest = json.loads(staged_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise ValueError("The staged NISAR verification record is malformed.") from None
+            groups, polarizations = _inspect_nisar_hdf5(
+                staged_product_path, expected_size, product["product_id"]
+            )
+            calculated = calculate_checksums(
+                staged_product_path,
+                include_md5=(
+                    checksum_algorithm == "md5"
+                    or manifest.get("provider_checksum_algorithm") == "md5"
+                ),
+            )
+            if (
+                manifest.get("product_id") != product["product_id"]
+                or manifest.get("sha256") != calculated["sha256"]
+                or manifest.get("file_size_bytes") != staged_product_path.stat().st_size
+            ):
+                raise ValueError("The staged NISAR verification record does not match the product.")
+            if checksum_value and calculated[checksum_algorithm] != checksum_value:
+                raise ValueError("The staged NISAR product does not match the ASF provider checksum.")
+            staged_checksum = manifest.get("provider_checksum")
+            staged_algorithm = manifest.get("provider_checksum_algorithm")
+            if staged_checksum and (
+                staged_algorithm not in {"sha256", "md5"}
+                or calculated[staged_algorithm] != staged_checksum
+            ):
+                raise ValueError("The staged NISAR product does not match its recorded provider checksum.")
+            os.replace(staging_directory, product_directory)
+            return _record_verified_nisar_product(
+                product,
+                final_path,
+                product_url,
+                groups,
+                polarizations,
+                calculated,
+                manifest,
+                bool(checksum_value or staged_checksum),
+            )
+        if progress_callback is not None:
+            progress_callback("Downloading or resuming authenticated NISAR product")
+        try:
+            downloaded_size = _stream_nisar_product(
+                product_url,
+                session,
+                staged_path,
+                expected_size,
+            )
+            if expected_size is not None and downloaded_size != expected_size:
+                raise ValueError("The completed NISAR download does not match ASF catalog size.")
+            if progress_callback is not None:
+                progress_callback("Verifying SHA-256, provider checksum, and HDF5 metadata")
+            groups, polarizations = _inspect_nisar_hdf5(
+                staged_path, expected_size, product["product_id"]
+            )
+            calculated = calculate_checksums(
+                staged_path,
+                include_md5=checksum_algorithm == "md5",
+            )
+            if checksum_value and calculated[checksum_algorithm] != checksum_value:
+                staged_path.unlink(missing_ok=True)
+                raise ValueError("The downloaded NISAR product does not match the ASF provider checksum.")
+            downloaded_at = _now().isoformat()
+            provider_verified = bool(checksum_value)
+            os.replace(staged_path, staged_product_path)
+            manifest = {
+                "product_id": product["product_id"],
+                "acquisition_identifier": product["product_id"],
+                "acquisition_start": product.get("acquisition_start"),
+                "acquisition_end": product.get("acquisition_end"),
+                "product_type": "GCOV",
+                "file_name": product_name,
+                "file_size_bytes": downloaded_size,
+                "file_mtime_ns": staged_product_path.stat().st_mtime_ns,
+                "source_url_reference": _source_url_reference(product_url),
+                "download_timestamp": downloaded_at,
+                "sha256": calculated["sha256"],
+                "provider_checksum_algorithm": checksum_algorithm,
+                "provider_checksum": checksum_value,
+                "integrity_status": (
+                    "provider_checksum_verified"
+                    if provider_verified
+                    else "sha256_fingerprint_only"
+                ),
+                "structure_verification_status": "verified",
+                "provider_authenticity_status": (
+                    "provider_checksum_verified" if provider_verified else "not_verified"
+                ),
+                "scientific_validation_status": "not_performed",
+            }
+            temporary_manifest = staging_directory / "download-verification.json.tmp"
+            temporary_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            os.replace(temporary_manifest, staging_directory / "download-verification.json")
+            if product_directory.exists():
+                raise FileExistsError(
+                    "A local NISAR product appeared during download; refusing to replace it."
+                )
+            os.replace(staging_directory, product_directory)
+        except ValueError as error:
+            staged_path.unlink(missing_ok=True)
+            raise RuntimeError(str(error)) from None
+        except PermissionError:
+            raise
+        except RuntimeError as error:
+            raise RuntimeError(str(error)) from None
+        except Exception as error:
+            raise RuntimeError(
+                f"NISAR download or verification failed ({type(error).__name__}); "
+                "any incomplete transfer is retained for safe resumption."
+            ) from None
+
+    return _record_verified_nisar_product(
+        product,
+        final_path,
+        product_url,
+        groups,
+        polarizations,
+        calculated,
+        manifest,
+        bool(checksum_value),
     )
-    return product
+
+
+def _verification_message(provider_checksum_verified: bool, reused: bool = False) -> str:
+    if provider_checksum_verified:
+        source = "The provider checksum matched and the HDF5 structure and product identity were verified."
+    else:
+        source = (
+            "The HDF5 structure and product identity were verified; SHA-256 is only an integrity "
+            "fingerprint because ASF supplied no usable provider checksum."
+        )
+    suffix = " An existing product was reused." if reused else ""
+    return (
+        f"{source}{suffix} Provider authenticity beyond the available checksum and scientific "
+        "validity are not established."
+    )
+
+
+@contextmanager
+def _exclusive_product_download_lock(path: Path) -> Generator[None, None, None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise RuntimeError("Another process is downloading this NISAR product.") from error
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise RuntimeError("Another process is downloading this NISAR product.") from error
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _stream_nisar_product(
+    product_url: str,
+    session: Any,
+    partial_path: Path,
+    expected_size: int | None,
+) -> int:
+    partial_size = partial_path.stat().st_size if partial_path.is_file() else 0
+    if expected_size is not None and partial_size > expected_size:
+        partial_path.unlink()
+        partial_size = 0
+    headers = {"User-Agent": "SAR-Sentinel-India/0.1"}
+    if partial_size:
+        headers["Range"] = f"bytes={partial_size}-"
+    response = None
+    try:
+        response = session.get(
+            product_url,
+            headers=headers,
+            allow_redirects=True,
+            stream=True,
+            timeout=(30, 120),
+        )
+        status = response.status_code
+        response_headers = response.headers
+        final_url = getattr(response, "url", None) or product_url
+        if urlparse(str(final_url)).scheme.casefold() != "https":
+            raise RuntimeError("ASF redirected the product download to a non-HTTPS URL.")
+        final_host = (urlparse(str(final_url)).hostname or "").casefold()
+        content_type = response_headers.get("Content-Type", "").casefold()
+        if final_host == "urs.earthdata.nasa.gov" or content_type.startswith("text/html"):
+            raise PermissionError(
+                "Earthdata redirected the download to a login page; the token may be expired or lack product access."
+            )
+        if status in {401, 403}:
+            raise PermissionError(
+                "Earthdata/ASF rejected the authenticated product download; check the token and account access."
+            )
+        if status == 416 and partial_size:
+            content_range = response_headers.get("Content-Range", "")
+            match = re.fullmatch(r"bytes \*/(\d+)", content_range.strip())
+            total = int(match.group(1)) if match else None
+            if total == partial_size and (expected_size is None or total == expected_size):
+                return total
+            raise ValueError("ASF rejected the resume range because the partial file size is inconsistent.")
+        if status not in {200, 206}:
+            raise RuntimeError(f"ASF returned HTTP {status} for the product download.")
+
+        content_range = response_headers.get("Content-Range", "")
+        total_size: int | None = None
+        if status == 206:
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range.strip())
+            if not match:
+                raise ValueError("ASF returned an invalid Content-Range for the product download.")
+            range_start, range_end = int(match.group(1)), int(match.group(2))
+            total_size = None if match.group(3) == "*" else int(match.group(3))
+            if range_start != partial_size or range_end < range_start:
+                raise ValueError("ASF returned a mismatched resume range.")
+            if total_size is not None and range_end + 1 != total_size:
+                raise RuntimeError("ASF returned only part of the requested product range; retry to resume.")
+            mode = "ab" if partial_size else "wb"
+        else:
+            total_size = int(response_headers["Content-Length"]) if response_headers.get("Content-Length") else None
+            mode = "wb"
+            partial_size = 0
+        if expected_size is not None and total_size is not None and expected_size != total_size:
+            raise ValueError("ASF content size does not match catalog size metadata.")
+
+        with partial_path.open(mode) as output:
+            for chunk in response.iter_content(chunk_size=NISAR_DOWNLOAD_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        final_size = partial_path.stat().st_size
+        if total_size is None:
+            total_size = final_size
+        if expected_size is not None and final_size != expected_size:
+            raise RuntimeError("ASF transfer ended before the complete catalogued product was received.")
+        if total_size != final_size:
+            raise RuntimeError("ASF transfer ended before the complete product was received.")
+        return final_size
+    except PermissionError:
+        raise
+    except (ValueError, RuntimeError):
+        raise
+    except Exception as error:
+        raise RuntimeError(
+            f"ASF product transfer failed or was interrupted ({type(error).__name__}); "
+            "the partial file is retained for resumption."
+        ) from None
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _inspect_nisar_hdf5(
     path: Path,
     expected_size: Any,
+    expected_product_id: str,
 ) -> tuple[list[str], list[str]]:
     import h5py
 
@@ -546,56 +989,92 @@ def _inspect_nisar_hdf5(
         raise ValueError("The NISAR product is missing or empty.")
     if isinstance(expected_size, int) and path.stat().st_size != expected_size:
         raise ValueError("The NISAR file size does not match ASF catalog metadata.")
-    with h5py.File(path, "r") as dataset:
-        groups = sorted(name for name, value in dataset.items() if isinstance(value, h5py.Group))
-        if not groups:
-            raise ValueError("The NISAR HDF5 product has no readable top-level groups.")
-        if "science/LSAR/GCOV/grids" not in dataset:
-            raise ValueError("The HDF5 file does not contain the expected NISAR GCOV grids.")
-        polarizations: list[str] = []
-        for frequency in ("frequencyA", "frequencyB"):
-            polarization_path = f"science/LSAR/GCOV/grids/{frequency}/listOfPolarizations"
-            if polarization_path not in dataset:
-                continue
-            values = np.asarray(dataset[polarization_path][()]).reshape(-1).tolist()
-            for value in values:
-                if isinstance(value, bytes):
-                    value = value.decode("utf-8", errors="replace")
-                if isinstance(value, str) and value and value not in polarizations:
-                    polarizations.append(value)
-        if not polarizations:
-            raise ValueError("The NISAR GCOV product does not report any grid polarizations.")
-    return groups, polarizations
-
-
-def _check_nisar_download(product_url: str) -> tuple[str, str]:
     try:
-        with httpx.stream(
-            "GET",
-            product_url,
-            headers={"Range": "bytes=0-0", "User-Agent": "SAR-Sentinel-India/0.1"},
-            follow_redirects=True,
-            timeout=30,
-        ) as response:
-            final_host = response.url.host or ""
-            if response.status_code in {401, 403} or final_host.endswith("urs.earthdata.nasa.gov"):
-                return (
-                    "authentication_required",
-                    "NISAR GCOV metadata is available, but ASF redirects product access to NASA Earthdata Login. "
-                    "No credentials were available; no download or authentication bypass was attempted.",
-                )
-            if response.status_code in {200, 206}:
-                return (
-                    "publicly_accessible_unprocessed",
-                    "The NISAR product responds without Earthdata authentication, but an NISAR GCOV HDF5 "
-                    "reader is not implemented; this product was not downloaded or treated as processed.",
-                )
-            return (
-                "error",
-                f"The NISAR product access check returned HTTP {response.status_code}.",
+        with h5py.File(path, "r") as dataset:
+            return validate_nisar_gcov_hdf5(dataset, expected_product_id)
+    except OSError:
+        raise ValueError("The downloaded NISAR HDF5 product is malformed or incomplete.") from None
+
+
+def _is_approved_nisar_url(product_url: str) -> bool:
+    parsed_url = urlparse(product_url)
+    hostname = parsed_url.hostname or ""
+    return (
+        parsed_url.scheme == "https"
+        and parsed_url.username is None
+        and parsed_url.password is None
+        and (
+            hostname == "asf.earthdatacloud.nasa.gov"
+            or hostname.endswith(".asf.earthdatacloud.nasa.gov")
+        )
+    )
+
+
+def _check_nisar_download(
+    product_url: str,
+    session: Any | None = None,
+) -> tuple[str, str]:
+    if not _is_approved_nisar_url(product_url):
+        return "error", "ASF returned a NISAR URL outside the approved ASF Earthdata Cloud host."
+
+    headers = {"Range": "bytes=0-0", "User-Agent": "SAR-Sentinel-India/0.1"}
+    try:
+        if session is None:
+            with httpx.stream(
+                "GET",
+                product_url,
+                headers=headers,
+                follow_redirects=True,
+                timeout=30,
+            ) as response:
+                status_code = response.status_code
+                final_url = str(response.url)
+        else:
+            response = session.get(
+                product_url,
+                headers=headers,
+                allow_redirects=True,
+                timeout=30,
+                stream=True,
             )
-    except httpx.HTTPError as error:
-        return "error", f"NISAR product access check failed: {error}"
+            try:
+                status_code = response.status_code
+                final_url = str(response.url)
+            finally:
+                response.close()
+    except Exception as error:
+        return (
+            "error",
+            f"NISAR product access check failed ({type(error).__name__}); provider details were omitted.",
+        )
+
+    final_host = (urlparse(final_url).hostname or "").casefold()
+    redirected_to_login = final_host == "urs.earthdata.nasa.gov"
+    if status_code in {401, 403} or redirected_to_login:
+        if session is None:
+            return (
+                "authentication_required",
+                "NISAR GCOV data requires Earthdata Login. Configure EARTHDATA_TOKEN; no product bytes were downloaded.",
+            )
+        return (
+            "authentication_failed",
+            "Earthdata accepted the token but denied this product request, or the token was rejected or expired. "
+            "Check account authorization and generate a replacement token if needed.",
+        )
+    if status_code in {200, 206}:
+        if session is not None:
+            return (
+                "authenticated_access_verified",
+                "Authenticated ASF access was verified with a one-byte range request; no full product was downloaded.",
+            )
+        return (
+            "publicly_accessible_unprocessed",
+            "The NISAR product responds without Earthdata authentication; no product bytes were downloaded.",
+        )
+    return (
+        "error",
+        f"The NISAR product access check returned HTTP {status_code}; no product bytes were downloaded.",
+    )
 
 
 def _nisar_metadata(
@@ -603,40 +1082,104 @@ def _nisar_metadata(
     session: Any | None = None,
     authentication_error: str | None = None,
 ) -> dict[str, Any]:
+    authentication_checked_at = _now().isoformat()
+    authentication_status = (
+        "token_valid"
+        if session is not None
+        else authentication_error or "not_configured"
+    )
     try:
         features = _search_nisar(river_id, session=session)
+        successful_search = _now().isoformat()
         products = [
             product
             for feature in features
             if (product := _nisar_product_metadata(feature, authenticated=session is not None))
         ]
         if not products:
+            status = "no_data"
+            message = (
+                f"No NISAR GCOV product was found for this river in the last "
+                f"{SEARCH_LOOKBACK_DAYS} days."
+            )
+            if authentication_error in {"rejected", "error"}:
+                status = "error"
+                message = _earthdata_authentication_message(authentication_error)
+            elif authentication_error == "not_configured":
+                message += " EARTHDATA_TOKEN is not configured; protected data access was not tested."
             return {
-                "status": "no_data",
+                "status": status,
                 "product_id": None,
                 "acquisition_start": None,
                 "products": [],
-                "message": f"No NISAR GCOV product was found for this river in the last {SEARCH_LOOKBACK_DAYS} days.",
+                "message": message,
+                "authentication_status": authentication_status,
+                "authentication_checked_at": authentication_checked_at,
+                "last_successful_search": successful_search,
             }
         if session is None:
-            access_status, message = _check_nisar_download(products[0]["source_url"])
+            access_status, access_message = _check_nisar_download(
+                products[0].get("_download_url") or products[0]["source_url"]
+            )
             products[0]["availability"] = access_status
-            products[0]["message"] = message
-            if authentication_error:
+            products[0]["message"] = access_message
+            if authentication_error == "not_configured":
+                authentication_status = "not_configured"
+                if access_status == "authentication_required":
+                    status = "authentication_required"
+                    message = (
+                        f"{_earthdata_authentication_message(authentication_error)} "
+                        "No product bytes were downloaded."
+                    )
+                elif access_status == "publicly_accessible_unprocessed":
+                    status = "metadata_found"
+                    message = (
+                        "NISAR metadata and public product access are available, but EARTHDATA_TOKEN "
+                        "is not configured and authenticated access was not verified."
+                    )
+                else:
+                    status = "error"
+                    message = access_message
+            elif authentication_error == "rejected":
+                authentication_status = "rejected"
+                products[0]["availability"] = "authentication_failed"
                 status = "error"
                 message = (
-                    f"Earthdata token authentication could not be completed ({authentication_error}); "
-                    "ASF metadata was checked without credentials and Sentinel-1 fallback will continue."
+                    f"{_earthdata_authentication_message(authentication_error)} "
+                    "Unauthenticated metadata discovery may continue."
                 )
-                products[0]["message"] = message
             else:
-                status = access_status if access_status in {"authentication_required", "error"} else "metadata_found"
+                authentication_status = "error" if authentication_error else "not_configured"
+                status = "error" if authentication_error or access_status == "error" else (
+                    "metadata_found"
+                    if access_status == "publicly_accessible_unprocessed"
+                    else "authentication_required"
+                )
+                message = (
+                    _earthdata_authentication_message(authentication_error)
+                    if authentication_error
+                    else access_message
+                )
         else:
-            status = "metadata_found"
-            message = (
-                f"Authenticated ASF search found {len(products)} NISAR GCOV product(s). "
-                "NISAR GCOV HDF5 products are cataloged separately from the Sentinel-1 RTC processing pipeline."
+            access_status, access_message = _check_nisar_download(
+                products[0].get("_download_url") or products[0]["source_url"],
+                session=session,
             )
+            products[0]["availability"] = access_status
+            products[0]["message"] = access_message
+            if access_status == "authenticated_access_verified":
+                authentication_status = "data_access_verified"
+                status = "metadata_found"
+                message = (
+                    f"Authenticated ASF access to {len(products)} NISAR GCOV catalog product(s) "
+                    "was verified with a one-byte range request; no full product was downloaded."
+                )
+            else:
+                authentication_status = "rejected" if access_status == "authentication_failed" else "error"
+                status = "error"
+                message = access_message
+        products[0]["authentication_status"] = authentication_status
+        products[0]["authentication_checked_at"] = authentication_checked_at
         first = products[0]
         return {
             "status": status,
@@ -644,6 +1187,9 @@ def _nisar_metadata(
             "acquisition_start": first["acquisition_start"],
             "products": products,
             "message": message,
+            "authentication_status": authentication_status,
+            "authentication_checked_at": authentication_checked_at,
+            "last_successful_search": successful_search,
         }
     except (httpx.HTTPError, ValueError, KeyError) as error:
         LOGGER.warning("NISAR metadata search failed for %s (%s).", river_id, type(error).__name__)
@@ -653,6 +1199,9 @@ def _nisar_metadata(
             "acquisition_start": None,
             "products": [],
             "message": f"NISAR discovery failed ({type(error).__name__}); Sentinel-1 fallback will continue.",
+            "authentication_status": "error" if session is not None else authentication_status,
+            "authentication_checked_at": authentication_checked_at,
+            "last_successful_search": None,
         }
     except Exception as error:
         LOGGER.warning("NISAR metadata search failed for %s (%s).", river_id, type(error).__name__)
@@ -662,6 +1211,9 @@ def _nisar_metadata(
             "acquisition_start": None,
             "products": [],
             "message": f"NISAR discovery failed ({type(error).__name__}); Sentinel-1 fallback will continue.",
+            "authentication_status": "error" if session is not None else authentication_status,
+            "authentication_checked_at": authentication_checked_at,
+            "last_successful_search": None,
         }
 
 
@@ -670,8 +1222,6 @@ def _safe_product_id(product_id: str) -> str:
 
 
 def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
-    import h5py
-
     river_directory = (ACQUISITION_ROOT / river_id).resolve()
     if not river_directory.is_relative_to(ACQUISITION_ROOT.resolve()) or not river_directory.is_dir():
         return []
@@ -713,32 +1263,42 @@ def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
                 )
 
         try:
-            with h5py.File(product_path, "r") as dataset:
-                if "science/LSAR/GCOV" not in dataset:
-                    LOGGER.warning("Skipping cached NISAR product %s: GCOV group is absent.", product_id)
-                    continue
-                groups = sorted(
-                    name for name, value in dataset.items() if isinstance(value, h5py.Group)
-                )
-                polarizations: list[str] = []
-                for frequency in ("frequencyA", "frequencyB"):
-                    polarization_path = (
-                        f"science/LSAR/GCOV/grids/{frequency}/listOfPolarizations"
-                    )
-                    if polarization_path not in dataset:
-                        continue
-                    for value in np.asarray(dataset[polarization_path][()]).reshape(-1):
-                        if isinstance(value, bytes):
-                            value = value.decode("utf-8", errors="replace")
-                        if isinstance(value, str) and value and value not in polarizations:
-                            polarizations.append(value)
+            groups, polarizations = _inspect_nisar_hdf5(product_path, None, product_id)
         except (OSError, ValueError) as error:
             LOGGER.warning(
-                "Skipping cached NISAR product %s: HDF5 validation failed (%s).",
+                "Skipping cached NISAR product %s: structural or identity verification failed (%s).",
                 product_id,
                 type(error).__name__,
             )
             continue
+        verification: dict[str, Any] = {}
+        verification_path = product_directory / "download-verification.json"
+        if verification_path.is_file():
+            try:
+                verification = json.loads(verification_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                verification = {}
+        if (
+            verification.get("product_id") != product_id
+            or verification.get("file_name") != product_path.name
+            or verification.get("file_size_bytes") != product_path.stat().st_size
+        ):
+            verification = {}
+        elif verification.get("file_mtime_ns") != product_path.stat().st_mtime_ns:
+            checksums = calculate_checksums(
+                product_path,
+                include_md5=verification.get("provider_checksum_algorithm") == "md5",
+            )
+            if checksums["sha256"] != verification.get("sha256"):
+                LOGGER.warning("Skipping cached NISAR product %s: SHA-256 verification failed.", product_id)
+                continue
+            if (
+                verification.get("provider_checksum_algorithm")
+                and checksums[verification["provider_checksum_algorithm"]]
+                != verification.get("provider_checksum")
+            ):
+                LOGGER.warning("Skipping cached NISAR product %s: provider checksum verification failed.", product_id)
+                continue
 
         date_match = re.search(r"_(\d{8}T\d{6})_(\d{8}T\d{6})_", product_id)
         acquisition_start = metadata.get("acquisition_start")
@@ -773,9 +1333,11 @@ def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
         recovered.append(
             {
                 "product_id": product_id,
+                "acquisition_identifier": product_id,
                 "acquisition_start": acquisition_start,
                 "acquisition_end": acquisition_end,
                 "product_level": "GCOV",
+                "product_type": "GCOV",
                 "polarization": polarizations or None,
                 "size_bytes": product_path.stat().st_size,
                 "availability": "downloaded_verified",
@@ -783,7 +1345,22 @@ def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
                 "source_url": None,
                 "local_path": str(product_path.relative_to(REPOSITORY_ROOT)),
                 "hdf5_groups": groups,
-                "message": "Recovered from the verified local HDF5 product and processing metadata.",
+                "sha256": verification.get("sha256"),
+                "integrity_status": verification.get("integrity_status", "not_verified"),
+                "structure_verification_status": "verified",
+                "provider_authenticity_status": verification.get(
+                    "provider_authenticity_status", "not_verified"
+                ),
+                "scientific_validation_status": "not_performed",
+                "download_timestamp": verification.get("download_timestamp"),
+                "source_url_reference": verification.get("source_url_reference"),
+                "provider_checksum_algorithm": verification.get("provider_checksum_algorithm"),
+                "provider_checksum": verification.get("provider_checksum"),
+                "message": (
+                    "Recovered locally; NISAR structure and product identity passed validation. "
+                    "Provider authenticity depends on a recorded checksum; scientific validation "
+                    "is not performed by acquisition."
+                ),
                 "processing_status": processing_status,
                 "processing_message": None,
                 "processing_result": processing_result,
@@ -813,6 +1390,15 @@ def _merge_nisar_product_records(
                 "download_status",
                 "local_path",
                 "hdf5_groups",
+                "sha256",
+                "provider_checksum_algorithm",
+                "provider_checksum",
+                "integrity_status",
+                "structure_verification_status",
+                "provider_authenticity_status",
+                "scientific_validation_status",
+                "download_timestamp",
+                "source_url_reference",
                 "processing_status",
                 "processing_message",
                 "processing_result",
@@ -1093,11 +1679,15 @@ def _record_failure(
             item,
             coverage,
             status=status,
-            error=message,
+            error=redact_sensitive_text(message),
         )
         connection.commit()
     except (ValueError, KeyError, TypeError):
-        LOGGER.exception("Unable to record failed product %s for %s", item.get("id"), river_id)
+        LOGGER.error(
+            "Unable to record failed product %s for %s.",
+            item.get("id"),
+            river_id,
+        )
 
 
 def _process_candidate(
@@ -1237,8 +1827,10 @@ def _write_scan(
         """
         INSERT INTO river_scans (
             river_id, status, last_checked_at, nisar_status, nisar_product_id,
-            nisar_acquisition_start, nisar_message, nisar_products_json, candidate_count, message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            nisar_acquisition_start, nisar_message, nisar_products_json,
+            nisar_authentication_status, nisar_authentication_checked_at,
+            nisar_last_successful_search, candidate_count, message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(river_id) DO UPDATE SET
             status=excluded.status,
             last_checked_at=excluded.last_checked_at,
@@ -1247,6 +1839,12 @@ def _write_scan(
             nisar_acquisition_start=excluded.nisar_acquisition_start,
             nisar_message=excluded.nisar_message,
             nisar_products_json=excluded.nisar_products_json,
+            nisar_authentication_status=excluded.nisar_authentication_status,
+            nisar_authentication_checked_at=excluded.nisar_authentication_checked_at,
+            nisar_last_successful_search=COALESCE(
+                excluded.nisar_last_successful_search,
+                river_scans.nisar_last_successful_search
+            ),
             candidate_count=excluded.candidate_count,
             message=excluded.message
         """,
@@ -1257,13 +1855,34 @@ def _write_scan(
             nisar.get("status", "not_checked"),
             nisar.get("product_id"),
             nisar.get("acquisition_start"),
-            nisar.get("message"),
-            json.dumps(nisar_products if nisar_products is not None else nisar.get("products", [])),
+            redact_sensitive_text(nisar.get("message") or ""),
+            json.dumps(
+                _catalog_product_records(
+                    nisar_products if nisar_products is not None else nisar.get("products", [])
+                )
+            ),
+            nisar.get("authentication_status", "unknown"),
+            nisar.get("authentication_checked_at"),
+            nisar.get("last_successful_search"),
             candidate_count,
-            message,
+            redact_sensitive_text(message) if message is not None else None,
         ),
     )
     connection.commit()
+
+
+def _catalog_product_records(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for product in products:
+        record = {key: value for key, value in product.items() if key != "_download_url"}
+        if isinstance(record.get("source_url"), str):
+            record["source_url"] = _source_url_reference(record["source_url"])
+        if isinstance(record.get("source_url_reference"), str):
+            record["source_url_reference"] = _source_url_reference(
+                record["source_url_reference"]
+            )
+        records.append(record)
+    return records
 
 
 def _refresh_river(
@@ -1280,7 +1899,12 @@ def _refresh_river(
     discovered_products = nisar.get("products", [])
     cached_products = _cached_nisar_product_records(connection, river_id)
     download_attempted = False
-    if download_nisar and nisar_session is not None and discovered_products:
+    if (
+        download_nisar
+        and nisar_session is not None
+        and discovered_products
+        and nisar.get("authentication_status") == "data_access_verified"
+    ):
         download_attempted = True
         product = discovered_products[0]
         prior = next(
@@ -1359,7 +1983,12 @@ def _refresh_river(
                 no_valid_data_count += 1
                 continue
             except Exception as error:
-                LOGGER.exception("Satellite acquisition/processing failed for %s (%s)", river_id, product_id)
+                LOGGER.error(
+                    "Satellite acquisition/processing failed for %s (%s): %s",
+                    river_id,
+                    product_id,
+                    redact_sensitive_text(str(error)),
+                )
                 _record_failure(connection, river_id, item, river_geometry, str(error))
                 continue
         existing = connection.execute(
@@ -1422,7 +2051,12 @@ def _refresh_river(
             )
         return download_attempted
     except Exception as error:
-        LOGGER.exception("Automatic catalog refresh failed for %s", river_id)
+        LOGGER.error(
+            "Automatic catalog refresh failed for %s (%s): %s",
+            river_id,
+            type(error).__name__,
+            redact_sensitive_text(str(error)),
+        )
         _write_scan(
             connection,
             river_id,
@@ -1452,7 +2086,10 @@ def refresh_catalog() -> AcquisitionStatus:
                 if not isinstance(sas_token, str) or not sas_token:
                     raise ValueError("Planetary Computer did not return a read-only SAS token.")
             except (httpx.HTTPError, ValueError) as error:
-                LOGGER.exception("Unable to obtain Planetary Computer Sentinel-1 RTC read token")
+                LOGGER.error(
+                    "Unable to obtain Planetary Computer Sentinel-1 RTC read token (%s).",
+                    type(error).__name__,
+                )
                 for river in RIVER_CATALOG:
                     nisar = _nisar_metadata(river.id, nisar_session, authentication_error)
                     nisar_products = _merge_nisar_product_records(
@@ -1722,6 +2359,15 @@ def _status_from_connection(connection: sqlite3.Connection) -> AcquisitionStatus
                 nisar_product_id=scan["nisar_product_id"] if scan else None,
                 nisar_acquisition_start=_timestamp(scan["nisar_acquisition_start"]) if scan else None,
                 nisar_message=scan["nisar_message"] if scan else None,
+                earthdata_authentication_status=(
+                    scan["nisar_authentication_status"] if scan else "unknown"
+                ),
+                earthdata_authentication_checked_at=(
+                    _timestamp(scan["nisar_authentication_checked_at"]) if scan else None
+                ),
+                last_successful_nisar_search=(
+                    _timestamp(scan["nisar_last_successful_search"]) if scan else None
+                ),
                 nisar_products=[
                     NisarProduct.model_validate(product)
                     for product in json.loads(scan["nisar_products_json"] or "[]")
@@ -1839,7 +2485,7 @@ def _save_nisar_product_record(
         )
         if product_index is None:
             raise FileNotFoundError(f"No NISAR catalog entry found for {river_id}/{product_id}.")
-        products[product_index] = updated_product
+        products[product_index] = _catalog_product_records([updated_product])[0]
         connection.execute(
             "UPDATE river_scans SET nisar_products_json=? WHERE river_id=?",
             (json.dumps(products), river_id),
@@ -2233,12 +2879,15 @@ def process_nisar_product(river_id: str, product_id: str) -> dict[str, Any]:
             return result
         except Exception as error:
             product["processing_status"] = "failed"
-            product["processing_message"] = f"{type(error).__name__}: {error}"
+            product["processing_message"] = redact_sensitive_text(
+                f"{type(error).__name__}: {error}"
+            )
             _save_nisar_product_record(river_id, product_id, product)
-            LOGGER.exception(
-                "NISAR GCOV processing failed for %s / %s.",
+            LOGGER.error(
+                "NISAR GCOV processing failed for %s / %s (%s).",
                 river_id,
                 product_id,
+                type(error).__name__,
             )
             raise
     finally:
@@ -2372,6 +3021,10 @@ async def automatic_refresh_loop() -> None:
     while automatic_acquisition_enabled():
         try:
             await refresh_catalog_async()
-        except Exception:
-            LOGGER.exception("Unexpected error in scheduled satellite acquisition")
+        except Exception as error:
+            LOGGER.error(
+                "Unexpected error in scheduled satellite acquisition (%s): %s",
+                type(error).__name__,
+                redact_sensitive_text(str(error)),
+            )
         await asyncio.sleep(POLL_INTERVAL_SECONDS)

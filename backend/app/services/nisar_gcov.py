@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from app.services.nisar_product import validate_nisar_gcov_hdf5
 from app.services.rivers import RIVER_CATALOG
 
 PROCESSOR_VERSION = "nisar-gcov-candidate-1"
@@ -87,12 +88,6 @@ def _otsu_threshold(histogram: np.ndarray, edges: np.ndarray) -> float:
 def _db(power: np.ndarray) -> np.ndarray:
     floor = 10.0 ** (HISTOGRAM_MIN_DB / 10.0)
     return (10.0 * np.log10(np.maximum(power, floor))).astype(np.float32, copy=False)
-
-
-def _attribute_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
 
 
 def _tiles(height: int, width: int) -> Iterator[tuple[int, int, int, int]]:
@@ -640,6 +635,7 @@ def process_gcov_product(
     from shapely.geometry import box, shape
 
     with h5py.File(hdf5_path, "r") as source:
+        _, polarizations = validate_nisar_gcov_hdf5(source, product_id)
         base = f"science/LSAR/GCOV/grids/{FREQUENCY}/"
         required_paths = {
             "hh": base + "HHHH",
@@ -652,12 +648,6 @@ def process_gcov_product(
             "polarizations": base + "listOfPolarizations",
             "validity_mask": base + "mask",
         }
-        missing = [path for path in required_paths.values() if path not in source]
-        if missing:
-            raise ValueError(
-                "NISAR GCOV product is missing required frequency-A datasets: "
-                + ", ".join(missing)
-            )
         hh_dataset = source[required_paths["hh"]]
         hv_dataset = source[required_paths["hv"]]
         validity_mask_dataset = source[required_paths["validity_mask"]]
@@ -666,37 +656,8 @@ def process_gcov_product(
         projection = source[required_paths["projection"]]
         x_spacing = float(source[required_paths["x_spacing"]][()])
         y_spacing = float(source[required_paths["y_spacing"]][()])
-        polarizations = [
-            _attribute_text(item)
-            for item in source[required_paths["polarizations"]][()]
-        ]
-        if hh_dataset.shape != hv_dataset.shape or hh_dataset.shape != validity_mask_dataset.shape:
-            raise ValueError("NISAR frequency-A HH, HV, and validity-mask grids have different dimensions.")
-        if hh_dataset.shape != (len(y_coordinates), len(x_coordinates)):
-            raise ValueError("NISAR frequency-A coordinate arrays do not match the HH/HV grids.")
-        if "HH" not in polarizations or "HV" not in polarizations:
-            raise ValueError("NISAR frequency-A metadata does not declare both HH and HV.")
-        if _attribute_text(hh_dataset.attrs.get("units", b"")) != "1":
-            raise ValueError("NISAR HH covariance units were not the expected linear power units ('1').")
-        if _attribute_text(hv_dataset.attrs.get("units", b"")) != "1":
-            raise ValueError("NISAR HV covariance units were not the expected linear power units ('1').")
-        if _attribute_text(hh_dataset.attrs.get("grid_mapping", b"")) != "projection":
-            raise ValueError("NISAR HH covariance does not reference its projection grid mapping.")
         epsg_code = int(projection.attrs.get("epsg_code", 0))
-        if epsg_code <= 0:
-            raise ValueError("NISAR GCOV projection metadata does not include a valid EPSG code.")
-        dx_values = np.diff(x_coordinates)
-        dy_values = np.diff(y_coordinates)
-        if (
-            x_spacing <= 0
-            or y_spacing == 0
-            or not np.allclose(dx_values, x_spacing, rtol=1e-6, atol=1e-5)
-            or not np.allclose(dy_values, y_spacing, rtol=1e-6, atol=1e-5)
-        ):
-            raise ValueError("NISAR coordinate axes are not regular with the declared pixel spacing.")
         pixel_area_m2 = abs(x_spacing * y_spacing)
-        if pixel_area_m2 <= 0:
-            raise ValueError("NISAR GCOV declares an invalid pixel area.")
 
         source_crs = f"EPSG:{epsg_code}"
         full_transform = Affine(
@@ -810,7 +771,7 @@ def process_gcov_product(
                     "projection": required_paths["projection"],
                 },
                 "acquisition_start": None,
-                "polarization": ["HH", "HV"],
+                "polarization": polarizations,
                 "input_crs": source_crs,
                 "pixel_size_m": math.sqrt(pixel_area_m2),
                 "reference_centerline_coverage_percent": centerline_coverage_percent,
@@ -984,7 +945,7 @@ def process_gcov_product(
                     "projection": required_paths["projection"],
                 },
                 "acquisition_start": None,
-                "polarization": ["HH", "HV"],
+                "polarization": polarizations,
                 "input_crs": source_crs,
                 "pixel_size_m": math.sqrt(pixel_area_m2),
                 "reference_centerline_coverage_percent": centerline_coverage_percent,

@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Annotated, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
+from app.redaction import redact_sensitive_text, redact_url
 
 AcquisitionState = Literal[
     "idle",
@@ -71,6 +73,11 @@ class AcquiredObservation(BaseModel):
     caveats: list[str]
     downloaded_at: datetime
 
+    @field_validator("stac_item_url", "asset_source_url", mode="before")
+    @classmethod
+    def redact_external_urls(cls, value: str) -> str:
+        return redact_url(value) or ""
+
 
 class AcquisitionIssue(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -79,6 +86,11 @@ class AcquisitionIssue(BaseModel):
     status: Literal["failed", "acquiring", "processing"]
     error: str | None = None
     updated_at: datetime
+
+    @field_validator("error", mode="before")
+    @classmethod
+    def redact_error(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value) if value is not None else None
 
 
 class NisarProcessingResult(BaseModel):
@@ -180,17 +192,87 @@ class NisarProduct(BaseModel):
     acquisition_start: datetime | None = None
     acquisition_end: datetime | None = None
     product_level: str
+    product_type: str = "GCOV"
     polarization: list[str] | None = None
     size_bytes: int | None = None
     availability: str
     download_status: str
     source_url: str | None = None
+    source_url_reference: str | None = None
     local_path: str | None = None
+    acquisition_identifier: str | None = None
     hdf5_groups: list[str] = Field(default_factory=list)
+    sha256: str | None = None
+    provider_checksum_algorithm: Literal["sha256", "md5"] | None = None
+    provider_checksum: str | None = None
+    integrity_status: Literal[
+        "not_verified",
+        "provider_checksum_verified",
+        "sha256_fingerprint_only",
+    ] = "not_verified"
+    structure_verification_status: Literal["not_verified", "verified", "rejected"] = "not_verified"
+    provider_authenticity_status: Literal[
+        "not_verified",
+        "provider_checksum_verified",
+    ] = "not_verified"
+    scientific_validation_status: Literal[
+        "not_performed",
+        "independently_validated",
+    ] = "not_performed"
+    download_timestamp: datetime | None = None
     message: str | None = None
+    authentication_status: Literal[
+        "unknown",
+        "not_configured",
+        "token_valid",
+        "data_access_verified",
+        "rejected",
+        "error",
+    ] = "unknown"
+    authentication_checked_at: datetime | None = None
     processing_status: Literal["not_attempted", "processing", "processed", "no_data", "failed"] = "not_attempted"
     processing_message: str | None = None
     processing_result: NisarProcessingResult | None = None
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def redact_source_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parts = urlsplit(value)
+        if parts.scheme and parts.netloc:
+            query = parse_qsl(parts.query, keep_blank_values=True)
+            has_signed_parameters = any(
+                key.casefold().startswith("x-amz-")
+                or key.casefold() in {"sig", "signature"}
+                for key, _ in query
+            )
+            if has_signed_parameters:
+                query = [
+                    (key, item)
+                    for key, item in query
+                    if not key.casefold().startswith("x-amz-")
+                    and key.casefold() not in {"sig", "signature"}
+                ]
+            value = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(query), "")
+            )
+        return redact_url(value)
+
+    @field_validator("source_url_reference", mode="before")
+    @classmethod
+    def remove_source_url_reference_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parts = urlsplit(value)
+        if parts.scheme and parts.netloc:
+            value = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return redact_url(value)
+
+    @field_validator("message", "processing_message", mode="before")
+    @classmethod
+    def redact_messages(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value) if value is not None else None
 
 
 class RiverAcquisitionStatus(BaseModel):
@@ -203,12 +285,27 @@ class RiverAcquisitionStatus(BaseModel):
     nisar_product_id: str | None = None
     nisar_acquisition_start: datetime | None = None
     nisar_message: str | None = None
+    earthdata_authentication_status: Literal[
+        "unknown",
+        "not_configured",
+        "token_valid",
+        "data_access_verified",
+        "rejected",
+        "error",
+    ] = "unknown"
+    earthdata_authentication_checked_at: datetime | None = None
+    last_successful_nisar_search: datetime | None = None
     nisar_products: list[NisarProduct] = Field(default_factory=list)
     candidate_count: int = 0
     latest_observation: AcquiredObservation | None = None
     observations: list[AcquiredObservation]
     issues: list[AcquisitionIssue]
     message: str | None = None
+
+    @field_validator("nisar_message", "message", mode="before")
+    @classmethod
+    def redact_messages(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value) if value is not None else None
 
 
 class AcquisitionStatus(BaseModel):
@@ -221,6 +318,11 @@ class AcquisitionStatus(BaseModel):
     source_url: str
     license: str
     rivers: list[RiverAcquisitionStatus]
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def redact_source_url(cls, value: str) -> str:
+        return redact_url(value) or ""
 
     @computed_field
     @property
@@ -238,11 +340,35 @@ class AcquisitionStatus(BaseModel):
             key=lambda result: result.processing_completed_at.timestamp(),
             default=None,
         )
+        authentication_checks = [
+            river
+            for river in self.rivers
+            if river.earthdata_authentication_checked_at is not None
+        ]
+        latest_authentication_check = max(
+            authentication_checks,
+            key=lambda river: river.earthdata_authentication_checked_at.timestamp(),
+            default=None,
+        )
+        successful_searches = [
+            river.last_successful_nisar_search
+            for river in self.rivers
+            if river.last_successful_nisar_search is not None
+        ]
         return {
             "provider": "ASF DAAC",
-            "provider_connectivity": "unknown",
-            "authentication_status": "unknown",
-            "last_successful_search": None,
+            "provider_connectivity": "available" if successful_searches else "unknown",
+            "authentication_status": (
+                latest_authentication_check.earthdata_authentication_status
+                if latest_authentication_check
+                else "unknown"
+            ),
+            "authentication_checked_at": (
+                latest_authentication_check.earthdata_authentication_checked_at
+                if latest_authentication_check
+                else None
+            ),
+            "last_successful_search": max(successful_searches, default=None),
             "cached_product_count": len({p.product_id for p in products}),
             "recorded_download_count": len({p.product_id for p in products if p.download_status == "downloaded"}),
             "recorded_inspection_count": len({p.product_id for p in inspected}),
@@ -284,3 +410,8 @@ class AcquisitionJob(BaseModel):
     error_message: str | None = None
     output_references: dict[str, str] = Field(default_factory=dict)
     retry_of_job_id: str | None = None
+
+    @field_validator("error_message", mode="before")
+    @classmethod
+    def redact_error(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value) if value is not None else None
