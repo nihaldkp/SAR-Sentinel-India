@@ -101,6 +101,12 @@ class NisarProcessingResult(BaseModel):
     status: Literal["unvalidated_candidate", "no_valid_corridor_data"]
     processor_version: str
     algorithm: str
+    input_measurement_convention: str | None = None
+    input_backscatter_normalization_convention: str | None = None
+    input_backscatter_expression_convention: str | None = None
+    power_to_db_conversion: str | None = None
+    power_to_db_floor_linear: float | None = None
+    power_to_db_floor_db: float | None = None
     frequency: str
     dataset_paths: dict[str, str]
     acquisition_start: datetime | None = None
@@ -189,12 +195,17 @@ class NisarProduct(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     product_id: str
+    platform: str | None = None
     acquisition_start: datetime | None = None
     acquisition_end: datetime | None = None
     product_level: str
+    processing_type: str | None = None
     product_type: str = "GCOV"
     polarization: list[str] | None = None
     size_bytes: int | None = None
+    footprint: dict | None = None
+    corridor_coverage_percent: float | None = Field(default=None, ge=0, le=100)
+    metadata_source: str | None = None
     availability: str
     download_status: str
     source_url: str | None = None
@@ -273,6 +284,25 @@ class NisarProduct(BaseModel):
     @classmethod
     def redact_messages(cls, value: str | None) -> str | None:
         return redact_sensitive_text(value) if value is not None else None
+
+
+class NisarMetadataRegistrationRequest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    river_id: str = Field(min_length=1, max_length=80)
+    product_id: str = Field(min_length=1, max_length=512)
+
+
+class NisarMetadataRegistrationResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    river_id: str
+    product: NisarProduct
+    registration_status: Literal["registered", "already_registered"]
+    corridor_intersects: bool
+    corridor_coverage_percent: float = Field(ge=0, le=100)
+    coverage_basis: Literal["buffered_centerline_corridor"] = "buffered_centerline_corridor"
+    coverage_sufficiency: Literal["not_assessed"] = "not_assessed"
 
 
 class RiverAcquisitionStatus(BaseModel):

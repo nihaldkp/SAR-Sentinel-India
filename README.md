@@ -76,6 +76,7 @@ Initial endpoints:
 - `GET /api/rivers/{river_id}`
 - `GET /api/satellite/search?river_id=kaveri&mission=NISAR&start_date=2026-10-01&end_date=2026-10-31&product_type=GCOV`
 - `GET /api/acquisitions`
+- `POST /api/acquisitions/nisar/metadata` — registers metadata for the explicitly supplied ASF product ID only; it does not download the HDF5 product or start an acquisition job.
 - `POST /api/acquisitions/refresh`
 - `POST /api/acquisitions/nisar/{product_id}/process?river_id=tungabhadra`
 - `GET /api/acquisitions/nisar/{product_id}/processing?river_id=tungabhadra`

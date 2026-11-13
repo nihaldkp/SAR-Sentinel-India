@@ -18,6 +18,8 @@ def _write_gcov_fixture(
     include_hv: bool = True,
     valid_data: bool = True,
     product_id: str = TEST_PRODUCT_ID,
+    normalization_convention: str = "gamma0",
+    expression_convention: str = "Linear power",
 ) -> None:
     h5py = pytest.importorskip("h5py")
     height = width = 32
@@ -37,6 +39,17 @@ def _write_gcov_fixture(
         }.items():
             identification.create_dataset(field, data=np.bytes_(value))
         identification.create_dataset("listOfFrequencies", data=np.asarray([b"A"], dtype="S1"))
+        rtc_parameters = dataset.create_group(
+            "science/LSAR/GCOV/metadata/processingInformation/parameters/rtc"
+        )
+        rtc_parameters.create_dataset(
+            "outputBackscatterNormalizationConvention",
+            data=np.bytes_(normalization_convention),
+        )
+        rtc_parameters.create_dataset(
+            "outputBackscatterExpressionConvention",
+            data=np.bytes_(expression_convention),
+        )
         grid = dataset.create_group("science/LSAR/GCOV/grids/frequencyA")
         projection = grid.create_dataset("projection", data=np.uint32(32643))
         projection.attrs["epsg_code"] = np.uint32(32643)
@@ -111,6 +124,12 @@ def test_process_small_gcov_fixture_preserves_georeferencing_and_nodata(
     assert result["input_crs"] == "EPSG:32643"
     assert result["pixel_size_m"] == 10
     assert result["polarization"] == ["HH", "HV"]
+    assert result["input_measurement_convention"] == "gamma0 linear power"
+    assert result["input_backscatter_normalization_convention"] == "gamma0"
+    assert result["input_backscatter_expression_convention"] == "Linear power"
+    assert result["power_to_db_conversion"] == "10*log10(max(power, 1e-6))"
+    assert result["power_to_db_floor_linear"] == pytest.approx(1e-6)
+    assert result["power_to_db_floor_db"] == pytest.approx(-60)
     assert result["valid_pixel_count"] == 1023
     assert result["corridor_pixel_count"] == 1024
     assert result["valid_data_fraction"] == pytest.approx(1023 / 1024)
@@ -355,6 +374,8 @@ def test_gcov_processor_reports_no_data_without_fabricating_a_mask(
 
     assert result["status"] == "no_valid_corridor_data"
     assert NisarProcessingResult.model_validate(result).status == "no_valid_corridor_data"
+    assert result["input_measurement_convention"] == "gamma0 linear power"
+    assert result["power_to_db_conversion"] == "10*log10(max(power, 1e-6))"
     assert result["corridor_pixel_count"] > 0
     assert result["valid_pixel_count"] == 0
     assert result["candidate_water_area_m2"] is None
@@ -363,3 +384,30 @@ def test_gcov_processor_reports_no_data_without_fabricating_a_mask(
     assert not (output_directory / "candidate-water-mask.tif").exists()
     assert not (output_directory / "gcov-measurements.tif").exists()
     assert (output_directory / "processing-metadata.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("normalization_convention", "expression_convention"),
+    [("sigma0", "Linear power"), ("gamma0", "Decibels")],
+)
+def test_gcov_processor_rejects_unsupported_measurement_conventions(
+    tmp_path: Path,
+    monkeypatch: Any,
+    normalization_convention: str,
+    expression_convention: str,
+) -> None:
+    source_path = tmp_path / "unsupported-convention.h5"
+    _write_gcov_fixture(
+        source_path,
+        normalization_convention=normalization_convention,
+        expression_convention=expression_convention,
+    )
+    monkeypatch.setattr(nisar_gcov, "RIVER_CATALOG", [_fixture_river()])
+
+    with pytest.raises(ValueError, match="requires gamma0 measurements expressed as linear power"):
+        nisar_gcov.process_gcov_product(
+            source_path,
+            TEST_PRODUCT_ID,
+            "test-river",
+            tmp_path / "processing",
+        )
