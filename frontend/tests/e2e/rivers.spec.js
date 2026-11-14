@@ -197,7 +197,10 @@ test.beforeEach(async ({ page }) => {
         },
         validation_status: "independent_reference_unavailable",
         validation_explanation: "No imported reference or matching validation report is available.",
-        findings: ["NISAR candidate result is unvalidated."],
+        findings: [
+          "NISAR candidate result is unvalidated.",
+          "NISAR product NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001 is exploratory.",
+        ],
         warnings: ["No independent reference."],
         limitations: ["No accuracy metrics are available."],
         recommended_next_steps: ["Obtain independently reviewed reference labels."],
@@ -215,6 +218,116 @@ test.beforeEach(async ({ page }) => {
   await page.route("https://*.tile.openstreetmap.org/**", (route) => route.abort());
   await page.goto("/");
   await expect(page.getByRole("combobox", { name: "Select river" })).toBeEnabled();
+});
+
+test("page exports download selected workspace reports without candidate analysis", async ({ page }) => {
+  const requests = [];
+  await page.route("**/api/sentinel2/observations**", async (route) => {
+    const riverId = new URL(route.request().url()).searchParams.get("river_id");
+    await route.fulfill({ json: {
+      river_id: riverId, source: "Microsoft Planetary Computer", collection: "sentinel-2-l2a",
+      observations: [{
+        river_id: riverId, item_id: "S2_TEST", status: "processed",
+        source: "Microsoft Planetary Computer", collection: "sentinel-2-l2a",
+        acquisition_datetime: "2026-11-13T05:10:41Z", valid_pixel_count: 10,
+        valid_pixel_percent: 50, resolution_m: 20, crs: "EPSG:32643",
+        bounds_wgs84: { west: 78, south: 10, east: 78.1, north: 10.1 },
+        index_statistics: {}, vegetation_validation: {}, limitations: [],
+      }], limitations: [],
+    } });
+  });
+  await page.route("**/api/sentinel2/*/*/*/png?**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.route("**/api/reports/workspace", async (route) => {
+    const body = route.request().postDataJSON();
+    requests.push(body);
+    await route.fulfill({
+      contentType: "application/pdf",
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-expose-headers": "Content-Disposition",
+        "content-disposition": `attachment; filename="Kaveri_${body.workspace.replaceAll(" ", "-")}.pdf"`,
+      },
+      body: "%PDF-1.4\nfixture",
+    });
+  });
+  await page.getByRole("combobox", { name: "Select river" }).selectOption("kaveri");
+  for (const workspace of ["Overview", "Map explorer", "Change analysis", "Impact explorer", "Agriculture", "Forest monitoring"]) {
+    await page.getByRole("button", { name: workspace, exact: true }).click();
+    if (workspace === "Agriculture" || workspace === "Forest monitoring") {
+      await page.getByLabel("Index").selectOption("ndmi");
+    }
+    const exportButton = page.getByRole("button", { name: "Export", exact: true });
+    await expect(exportButton).toBeEnabled();
+    const downloadPromise = page.waitForEvent("download");
+    await exportButton.click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe(`Kaveri_${workspace.replaceAll(" ", "-")}.pdf`);
+    const request = requests.at(-1);
+    expect(request.workspace).toBe(workspace);
+    expect(request.river_id).toBe("kaveri");
+    if (workspace === "Agriculture" || workspace === "Forest monitoring") {
+      expect(request.vegetation_item_id).toBe("S2_TEST");
+      expect(request.vegetation_river_id).toBe("kaveri");
+      expect(request.index_name).toBe("ndmi");
+    }
+    await expect(page.getByText(/Report downloaded:/)).toBeVisible();
+  }
+});
+
+test("page export prevents duplicates and displays service errors", async ({ page }) => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  await page.route("**/api/reports/workspace", async (route) => {
+    calls += 1;
+    await pending;
+    await route.fulfill({
+      status: 503,
+      headers: { "access-control-allow-origin": "*" },
+      json: { detail: "Report service unavailable" },
+    });
+  });
+  await page.getByRole("button", { name: "Export", exact: true }).click();
+  const loading = page.getByRole("button", { name: "Generating report..." });
+  await expect(loading).toBeDisabled();
+  expect(calls).toBe(1);
+  release();
+  await expect(page.getByRole("alert")).toContainText("Report service unavailable");
+  await expect(page.getByRole("button", { name: "Export", exact: true })).toBeEnabled();
+});
+
+test("map explorer loads tiles across its expanded map after navigation", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.route("https://*.tile.openstreetmap.org/**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.reload();
+  await expect(page.locator(".leaflet-map .leaflet-tile-loaded").first()).toBeVisible();
+  await page.getByRole("button", { name: "Map explorer", exact: true }).click();
+  const map = page.locator(".leaflet-map").first();
+  await expect.poll(() => map.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const x = bounds.right - 5;
+    const y = bounds.top + bounds.height / 2;
+    return [...element.querySelectorAll(".leaflet-tile")].some((tile) => {
+      const rect = tile.getBoundingClientRect();
+      return tile.complete && tile.naturalWidth > 0
+        && rect.left <= x && rect.right >= x && rect.top <= y && rect.bottom >= y;
+    });
+  })).toBe(true);
+});
+
+test("map explorer wraps long analysis product identifiers on mobile", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 900 });
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  await page.getByRole("button", { name: "Map explorer", exact: true }).click();
+  await page.getByRole("combobox", { name: "Select river" }).selectOption("tungabhadra");
+  await expect(page.getByText(/NISAR product NISAR_L2_UR_GCOV_/)).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(320);
 });
 
 test("river selection keeps the map legend aligned with visible centerlines", async ({ page }) => {
@@ -289,6 +402,22 @@ test("NWIC explorer pages search results and retains selected geometry", async (
   await explorer.getByLabel("River name or source ID").fill("missing");
   await expect(explorer.getByText(/0 matching source features/)).toBeVisible();
   await expect(explorer.getByText(/Selected: First fixture/)).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Select river" })).toHaveValue("both");
+});
+
+test("verified NWIC pilot match changes the monitoring selector without claiming coverage", async ({ page }) => {
+  await page.route("**/api/river-network/features?**", (route) => route.fulfill({
+    json: { total: 1, limit: 20, offset: 0, features: [{ source_object_id: "245", name: "Tungabhadra River" }] },
+  }));
+  await page.route("**/api/river-network/features/245/geometry", (route) => route.fulfill({
+    json: { type: "LineString", coordinates: [[76, 15], [76.1, 15.1]], pilot_match: { river_id: "tungabhadra" } },
+  }));
+  await page.reload();
+  const explorer = page.getByRole("region", { name: "NWIC river network explorer" });
+  await explorer.getByRole("button", { name: "Tungabhadra River · source ID 245" }).click();
+  await expect(page.getByRole("combobox", { name: "Select river" })).toHaveValue("tungabhadra");
+  await expect(explorer.getByText(/matched tungabhadra pilot/)).toContainText("satellite coverage is not established");
+  await expect(page.locator(".map-legend").getByText(/NWIC: Tungabhadra River/)).toBeVisible();
 });
 
 test("pilot selection cancels a pending NWIC geometry selection", async ({ page }) => {
@@ -315,12 +444,14 @@ test("pilot selection cancels a pending NWIC geometry selection", async ({ page 
   await expect(page.locator(".map-legend").getByText("Kaveri River · OSM")).toBeVisible();
 });
 
-test("centerline visibility toggles while unavailable bank layers stay disabled", async ({ page }) => {
+test("centerline and bank layer views toggle with explicit unavailable states", async ({ page }) => {
   const legend = page.locator(".map-legend");
   const centerline = page.getByRole("button", { name: "Centerline" });
+  const leftBank = page.getByRole("button", { name: "Left bank" });
+  const rightBank = page.getByRole("button", { name: "Right bank" });
 
-  await expect(page.getByRole("button", { name: "Left bank" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Right bank" })).toBeDisabled();
+  await expect(leftBank).toBeEnabled();
+  await expect(rightBank).toBeEnabled();
   await expect(legend.getByText("Kaveri River · OSM")).toBeVisible();
 
   await centerline.click();
@@ -330,6 +461,39 @@ test("centerline visibility toggles while unavailable bank layers stay disabled"
   await centerline.click();
   await expect(centerline).toHaveAttribute("aria-pressed", "true");
   await expect(legend.getByText("Kaveri River · OSM")).toBeVisible();
+
+  await leftBank.click();
+  await expect(leftBank).toHaveAttribute("aria-pressed", "true");
+  await expect(rightBank).toHaveAttribute("aria-pressed", "false");
+  await expect(legend.getByText("Left bank boundary data unavailable")).toBeVisible();
+
+  await rightBank.click();
+  await expect(leftBank).toHaveAttribute("aria-pressed", "false");
+  await expect(rightBank).toHaveAttribute("aria-pressed", "true");
+  await expect(legend.getByText("Right bank boundary data unavailable")).toBeVisible();
+
+  await page.getByRole("combobox", { name: "Select river" }).selectOption("tungabhadra");
+  await expect(leftBank).toBeEnabled();
+  await expect(rightBank).toBeEnabled();
+  await leftBank.click();
+  await expect(leftBank).toHaveAttribute("aria-pressed", "true");
+  await expect(rightBank).toHaveAttribute("aria-pressed", "false");
+  await expect(legend.getByText("Left bank boundary data unavailable")).toBeVisible();
+});
+
+test("sidebar navigation remains independently scrollable on short screens", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 420 });
+  const sidebar = page.locator(".sidebar");
+  const navigation = page.locator(".sidebar-nav-scroll");
+  await expect(sidebar.getByRole("button", { name: "Overview" })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: "About the project" })).toBeVisible();
+  await expect(navigation).toHaveCSS("overflow-y", "auto");
+  await expect(navigation).toHaveCSS("min-height", "0px");
+  const dimensions = await navigation.evaluate((element) => ({
+    scrollHeight: element.scrollHeight,
+    clientHeight: element.clientHeight,
+  }));
+  expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
 });
 
 test("compatible persisted Sentinel-1 candidates can be compared with provenance and common support", async ({ page }) => {
@@ -456,6 +620,7 @@ test("Sentinel-2 candidate details remain explicitly exploratory", async ({ page
     input_crs: "EPSG:32643",
     pixel_size_m: 10,
     valid_pixel_count: 100,
+    water_pixel_count: 100,
     valid_data_fraction: 1,
     candidate_water_area_m2: 1000,
     candidate_water_area_lower_m2: 800,
@@ -1240,6 +1405,7 @@ test("NISAR component sensitivity shows separate candidate scenarios and scienti
     input_crs: "EPSG:32643",
     pixel_size_m: 10,
     valid_pixel_count: 100,
+    water_pixel_count: 100,
     valid_data_fraction: 1,
     candidate_water_area_m2: 10_000,
     candidate_water_area_lower_m2: 8_000,
@@ -1397,6 +1563,13 @@ test("NISAR connection summary displays recorded authenticated product access", 
 });
 
 test("agriculture and forest pages disclose unavailable vegetation indicators", async ({ page }) => {
+  await page.route("**/api/sentinel2/observations**", async (route) => {
+    const riverId = new URL(route.request().url()).searchParams.get("river_id");
+    await route.fulfill({ json: {
+      river_id: riverId, source: "Microsoft Planetary Computer",
+      collection: "sentinel-2-l2a", observations: [], limitations: [],
+    } });
+  });
   await page.getByRole("button", { name: "Agriculture" }).click();
   await expect(page.getByRole("heading", { name: "Agriculture monitoring" })).toBeVisible();
   await expect(page.getByText("Vegetation indicators are not available")).toBeVisible();
@@ -1405,5 +1578,381 @@ test("agriculture and forest pages disclose unavailable vegetation indicators", 
   await page.getByRole("button", { name: "Forest monitoring" }).click();
   await expect(page.getByRole("region", { name: "Forest monitoring" }).getByRole("heading", { name: "Forest monitoring" })).toBeVisible();
   await expect(page.getByText("No forest index available")).toBeVisible();
+  await expect(page.getByText(/River-distance zones/)).toContainText("centerline");
   await expect(page.getByText(/deforestation, or agricultural statistics/)).toBeVisible();
+});
+
+test("agriculture displays processed Sentinel-2 indices without radar metric mixing", async ({ page }) => {
+  let failPreview = false;
+  let failRecords = false;
+  await page.route("**/api/sentinel2/*/*/*/png?**", async (route) => {
+    if (failPreview && new URL(route.request().url()).searchParams.has("overview")) {
+      await route.fulfill({ status: 503 });
+      return;
+    }
+    await route.fulfill({
+      contentType: "image/png",
+      headers: { "cache-control": "no-store" },
+      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+    });
+  });
+  const assessment = {
+    status: "VALIDATED",
+    reason: "The predeclared index RMSE criterion was met on the submitted target-class sample.",
+    protocol: {
+      reference_dataset: "Reviewed index fixture", reference_provider: "Fixture provider",
+      reference_source: "Fixture instrument", reference_license: "Fixture license",
+      reference_acquisition_datetime: "2026-11-12T05:10:41Z", reference_resolution_m: 20,
+      landcover_dataset: "Reviewed classes fixture", landcover_provider: "Fixture provider",
+      landcover_source: "Fixture survey", landcover_license: "Fixture license",
+      landcover_acquisition_datetime: "2026-11-11T05:10:41Z", landcover_resolution_m: 20,
+      reviewer: "Fixture reviewer", review_date: "2026-11-14", methodology: "Independent fixture survey",
+    },
+    metrics: {
+      common_target_pixels: 20, target_coverage_fraction: 0.25, target_spatial_blocks: 3,
+      crs: "EPSG:32643", bounds: [1, 2, 3, 4], rmse: 0.1, mae: 0.08, bias: 0.02,
+      classes: { agriculture: { count: 20, candidate_mean: 0.42 }, natural_forest: { count: 4, candidate_mean: 0.5 }, plantation: { count: 3, candidate_mean: 0.45 }, other: { count: 5, candidate_mean: 0.1 } },
+    },
+    limitations: ["Sample-scoped fixture only"],
+  };
+  await page.route("**/api/sentinel2/observations**", async (route) => {
+    if (failRecords) {
+      await route.fulfill({ status: 503, json: { detail: "Sentinel-2 unavailable" } });
+      return;
+    }
+    const url = new URL(route.request().url());
+    await route.fulfill({
+      json: {
+        river_id: url.searchParams.get("river_id"),
+        source: "Microsoft Planetary Computer",
+        collection: "sentinel-2-l2a",
+        observations: ["S2A_TEST_L2A", "S2B_TEST_L2A"].map((itemId) => ({
+          river_id: url.searchParams.get("river_id"),
+          item_id: itemId,
+          acquisition_datetime: "2026-11-13T05:10:41Z",
+          cloud_cover_percent: 8.5,
+          status: "processed",
+          source: "Microsoft Planetary Computer",
+          collection: "sentinel-2-l2a",
+          valid_pixel_count: 120,
+          valid_pixel_percent: 80,
+          crs: "EPSG:32643",
+          resolution_m: 20,
+          bounds_wgs84: { west: 78, south: 10, east: 78.1, north: 10.1 },
+          preview_color_scale: { low: "#313695", middle: "#ffffbf", high: "#006837" },
+          index_statistics: {
+            ndvi: { mean: 0.42, minimum: -0.2, maximum: 0.9 },
+            evi: { mean: 0.31, minimum: -0.1, maximum: 0.8 },
+            ndmi: { mean: 0.18, minimum: -0.3, maximum: 0.7 },
+          },
+          vegetation_validation: itemId === "S2A_TEST_L2A" ? {
+            "agriculture:ndvi": assessment,
+            "forest:ndvi": { ...assessment, status: "VALIDATION_FAILED", reason: "Forest index criterion was not met." },
+          } : {},
+          limitations: ["Unvalidated"],
+        })),
+        limitations: ["Unvalidated"],
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Agriculture" }).click();
+  await expect(page.getByRole("heading", { name: "Sentinel-2 Level-2A vegetation indices" })).toBeVisible();
+  await expect(page.getByLabel("Index")).toBeVisible();
+  await expect(page.getByLabel("Opacity")).toBeVisible();
+  await expect(page.locator(".sentinel2-index-card strong").first()).toHaveText("NDVI");
+  await expect(page.getByText("mean 0.420").first()).toBeVisible();
+  await expect(page.getByText(/80.00% valid centerline pixels/).first()).toBeVisible();
+  await expect(page.getByText(/Land-cover and change unvalidated/).first()).toBeVisible();
+  await expect(page.getByText("Index validation: NOT_VALIDATED").first()).toBeVisible();
+  await expect(page.getByText("Index validation: VALIDATED").first()).toBeVisible();
+  await expect(page.getByText(/Reviewed index fixture · Fixture provider/).first()).toBeVisible();
+  await expect(page.getByText(/RMSE 0.1000 · MAE 0.0800/).first()).toBeVisible();
+  await expect(page.getByText(/natural_forest: 4 \(mean 0.500\)/).first()).toBeVisible();
+  await expect(page.getByText("Sample-scoped fixture only").first()).toBeVisible();
+  const firstObservation = page.locator(".sentinel2-observation").first();
+  for (const index of ["ndvi", "evi", "ndmi"]) {
+    await expect(firstObservation.getByAltText(`${index.toUpperCase()} spatial index preview for S2A_TEST_L2A`))
+      .toHaveAttribute("src", new RegExp(`/S2A_TEST_L2A/${index}/png\\?render=3&overview=true$`));
+  }
+  const overlay = page.locator(".sentinel2-leaflet-map img.leaflet-image-layer");
+  await expect(overlay).toHaveAttribute("src", /S2A_TEST_L2A\/ndvi\/png\?render=3$/);
+  await expect(overlay).toHaveCSS("opacity", "0.85");
+  await page.getByLabel("Index").selectOption("evi");
+  await expect(overlay).toHaveAttribute("src", /S2A_TEST_L2A\/evi\/png\?render=3$/);
+  await page.getByLabel("Index").selectOption("ndmi");
+  await expect(overlay).toHaveAttribute("src", /S2A_TEST_L2A\/ndmi\/png\?render=3$/);
+  const recordSelector = page.getByLabel("Map observation");
+  const secondValue = await recordSelector.locator("option").nth(1).getAttribute("value");
+  await recordSelector.selectOption(secondValue);
+  await expect(overlay).toHaveAttribute("src", /S2B_TEST_L2A\/ndmi\/png\?render=3$/);
+  await expect(page.locator(".sentinel2-map-footer")).toContainText("NDMI · -1");
+  await expect(page.locator(".sentinel2-map-footer")).toContainText("+1 · transparent NoData");
+  failPreview = true;
+  await page.getByRole("button", { name: "Refresh saved records" }).click();
+  await firstObservation.scrollIntoViewIfNeeded();
+  await expect(firstObservation.getByText("Preview unavailable. Check the API and try refreshing the records.").first()).toBeVisible();
+  failPreview = false;
+  await page.getByRole("button", { name: "Refresh saved records" }).click();
+  await expect(firstObservation.getByAltText("NDVI spatial index preview for S2A_TEST_L2A")).toBeVisible();
+  await expect.poll(() => firstObservation.getByAltText("NDVI spatial index preview for S2A_TEST_L2A").evaluate((image) => image.naturalWidth)).toBeGreaterThan(0);
+  failRecords = true;
+  await page.getByRole("button", { name: "Refresh saved records" }).click();
+  await expect(page.getByRole("heading", { name: "Sentinel-2 observations unavailable" })).toBeVisible();
+  await expect(page.locator(".sentinel2-observation")).toHaveCount(0);
+  await expect(page.getByText("Loading", { exact: true })).toHaveCount(0);
+  failRecords = false;
+  await page.getByRole("button", { name: "Forest monitoring" }).click();
+  await expect(page.getByText("Index validation: VALIDATION_FAILED").first()).toBeVisible();
+  await expect(page.getByText("Forest index criterion was not met.").first()).toBeVisible();
+  await expect(page.getByText("Index validation: VALIDATED")).toHaveCount(0);
+});
+
+test("real-data Overview distinguishes NISAR and Sentinel-1 evidence without simulation", async ({ page }) => {
+  await page.route("**/api/acquisitions", async (route) => {
+    await route.fulfill({
+      json: {
+        enabled: false,
+        rivers: [{
+          ...acquisitionRiver("tungabhadra"),
+          nisar_status: "metadata_found",
+          nisar_products: [{
+            product_id: "NISAR_A009_STATUS_FIXTURE",
+            product_level: "GCOV",
+            polarization: ["HH", "HV"],
+            size_bytes: 10,
+            availability: "downloaded_verified",
+            download_status: "downloaded",
+            hdf5_groups: [],
+            local_path: "data/nisar-gcov/status-fixture.h5",
+            processing_status: "processed",
+            processing_result: {
+              status: "unvalidated_candidate",
+              input_crs: "EPSG:32643",
+              pixel_size_m: 10,
+              valid_pixel_count: 100,
+              water_pixel_count: 100,
+              valid_data_fraction: 1,
+              candidate_water_area_m2: 10000,
+              candidate_water_area_lower_m2: 9000,
+              candidate_water_area_upper_m2: 11000,
+              covered_centerline_length_km: 1,
+              reference_centerline_length_km: 2,
+              reference_centerline_coverage_percent: 50,
+              polarization_comparison: [],
+              threshold_sensitivity: [],
+              metadata_url: null,
+            },
+          }, {
+            product_id: "NISAR_A010_STATUS_FIXTURE",
+            product_level: "GCOV",
+            polarization: ["HH", "HV"],
+            size_bytes: 10,
+            availability: "downloaded_verified",
+            download_status: "downloaded",
+            hdf5_groups: [],
+            local_path: "data/nisar-gcov/status-fixture-no-data.h5",
+            processing_status: "no_data",
+            processing_result: {
+              status: "no_valid_corridor_data",
+              valid_pixel_count: 0,
+              corridor_pixel_count: 100,
+              covered_centerline_length_km: 1,
+              reference_centerline_length_km: 2,
+              reference_centerline_coverage_percent: 50,
+            },
+          }],
+          observations: [{
+            product_id: "S1_STATUS_FIXTURE",
+            platform: "Sentinel-1",
+            polarization: "VV",
+            acquisition_start: "2026-11-06T00:25:20Z",
+            orbit_state: "ascending",
+            relative_orbit: 1,
+            centerline_coverage_percent: 50,
+            pixel_size_m: 10,
+            input_crs: "EPSG:32643",
+            candidate_water_area_m2: 10000,
+            candidate_water_area_lower_m2: 9000,
+            candidate_water_area_upper_m2: 11000,
+            processing_status: "unvalidated_candidate",
+            valid_data_fraction: 1,
+            valid_pixel_count: 100,
+            water_pixel_count: 100,
+            threshold_db: -10,
+            filter_method: "Otsu",
+            corridor_half_width_m: 1500,
+            source_license: "CC-BY-4.0",
+            caveats: ["Unvalidated analytical candidate."],
+          }],
+        }],
+      },
+    });
+  });
+  await page.reload();
+
+  const acquisitionPanel = page.getByRole("article", { name: "Automatic satellite data acquisition" });
+  await expect(page.getByText("REAL DATA ONLY").first()).toBeVisible();
+  await expect(page.getByText("Overview values come from persisted satellite acquisition records")).toBeVisible();
+  await expect(page.getByText("Illustrative", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("not satellite-derived")).toHaveCount(0);
+  const realMetrics = page.locator('[aria-label="Real satellite overview"]');
+  await expect(realMetrics.getByText("3", { exact: true })).toBeVisible();
+  await expect(realMetrics.getByText("2", { exact: true })).toBeVisible();
+  await expect(realMetrics.getByText("100", { exact: true })).toBeVisible();
+  await expect(realMetrics.getByText("0.01 km²", { exact: true })).toBeVisible();
+  await expect(acquisitionPanel.getByText("Processed — scientifically unvalidated candidate")).toBeVisible();
+  await expect(acquisitionPanel.getByText("Source: locally recovered NISAR L2 UR GCOV product").first()).toBeVisible();
+  await expect(acquisitionPanel.getByText("No valid corridor data")).toBeVisible();
+  await expect(acquisitionPanel.getByText("Satellite observation · unvalidated analytical candidate")).toBeVisible();
+
+  await page.getByRole("button", { name: "Change analysis" }).click();
+  const timeline = page.getByRole("region", { name: "Change analysis" });
+  await expect(timeline.getByText("Processed — unvalidated candidate")).toBeVisible();
+  await expect(timeline.getByText("Processed — no usable corridor data")).toBeVisible();
+  await expect(timeline.getByText("Recovered locally · NISAR L2 UR GCOV acquisition")).toHaveCount(2);
+  await expect(timeline.getByText(/This is a processing outcome, not a failed satellite acquisition/)).toBeVisible();
+  await expect(timeline.getByText(/two compatible candidate masks are required/)).toBeVisible();
+  await expect(timeline.getByText(/no change percentage is calculated/)).toBeVisible();
+});
+
+test("Impact Explorer selects one latest eligible NISAR candidate without cross-date or cross-source sums", async ({ page }) => {
+  const nisarCandidate = (productId, acquisitionStart, validPixelCount, area) => ({
+    product_id: productId,
+    product_level: "GCOV",
+    polarization: ["HH", "HV"],
+    size_bytes: 10,
+    availability: "downloaded_verified",
+    download_status: "downloaded",
+    hdf5_groups: [],
+    acquisition_start: acquisitionStart,
+    local_path: `data/nisar-gcov/${productId}.h5`,
+    processing_status: "processed",
+    processing_result: {
+      status: "unvalidated_candidate",
+      valid_pixel_count: validPixelCount,
+      valid_data_fraction: 0.8,
+      pixel_size_m: 10,
+      candidate_water_area_m2: area,
+      covered_centerline_length_km: 1,
+      reference_centerline_length_km: 2,
+      reference_centerline_coverage_percent: 50,
+      candidate_water_area_lower_m2: area - 1000,
+      candidate_water_area_upper_m2: area + 1000,
+      threshold_sensitivity: [],
+      polarization_comparison: [],
+      threshold_db: -10,
+      hh_threshold_db: -10,
+      hv_threshold_db: -11,
+      filter_method: "Otsu",
+    },
+  });
+  await page.route("**/api/acquisitions", async (route) => {
+    await route.fulfill({
+      json: {
+        enabled: false,
+        rivers: [{
+          ...acquisitionRiver("kaveri"),
+          nisar_products: [
+            nisarCandidate("NISAR_OLDER", "2026-11-06T00:00:00Z", 111, 111000),
+            nisarCandidate("NISAR_LATEST", "2026-11-07T00:00:00Z", 222, 222000),
+            {
+              product_id: "NISAR_NO_DATA",
+              product_level: "GCOV",
+              polarization: ["HH", "HV"],
+              size_bytes: 10,
+              availability: "downloaded_verified",
+              download_status: "downloaded",
+              hdf5_groups: [],
+              acquisition_start: "2026-11-08T00:00:00Z",
+              processing_status: "no_data",
+              processing_result: {
+                status: "no_valid_corridor_data",
+                valid_pixel_count: 0,
+                corridor_pixel_count: 0,
+                covered_centerline_length_km: 0,
+                reference_centerline_length_km: 1,
+                reference_centerline_coverage_percent: 0,
+                candidate_water_area_m2: null,
+              },
+            },
+          ],
+          observations: [{
+            product_id: "S1_SEPARATE",
+            acquisition_start: "2026-11-09T00:00:00Z",
+            processing_status: "unvalidated_candidate",
+            valid_pixel_count: 999,
+            water_pixel_count: 999,
+            valid_data_fraction: 0.9,
+            candidate_water_area_m2: 999000,
+            candidate_water_area_lower_m2: 998000,
+            candidate_water_area_upper_m2: 1000000,
+            centerline_coverage_percent: 50,
+            pixel_size_m: 10,
+            input_crs: "EPSG:32643",
+            corridor_half_width_m: 1500,
+            filter_method: "Lee + Otsu",
+            threshold_db: -10,
+            source_license: "CC-BY-4.0",
+            caveats: ["Unvalidated analytical candidate."],
+          }],
+        }, {
+          ...acquisitionRiver("tungabhadra"),
+          nisar_products: [nisarCandidate("TUNG_LATEST", "2026-11-10T00:00:00Z", 333, 333000)],
+        }],
+      },
+    });
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Impact explorer" }).click();
+
+  const impact = page.getByRole("region", { name: "Impact explorer" });
+  await expect(impact.getByText("222", { exact: true }).first()).toBeVisible();
+  await expect(impact.getByText("2,22,000 m²", { exact: true }).first()).toBeVisible();
+  await expect(impact.getByText("NISAR_LATEST").first()).toBeVisible();
+  await expect(impact.getByText(/Historical acquisitions and Sentinel-1 records are not included/)).toBeVisible();
+  await expect(impact.getByText("999", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("combobox", { name: "Select river" }).selectOption("tungabhadra");
+  await expect(impact.getByText("333", { exact: true }).first()).toBeVisible();
+  await expect(impact.getByText("3,33,000 m²", { exact: true }).first()).toBeVisible();
+  await expect(impact.getByText("TUNG_LATEST").first()).toBeVisible();
+  await expect(impact.getByText("2,22,000 m²", { exact: true })).toHaveCount(0);
+});
+
+test("Impact Explorer reports unavailable metrics when no eligible NISAR candidate exists", async ({ page }) => {
+  await page.route("**/api/acquisitions", async (route) => {
+    await route.fulfill({
+      json: {
+        enabled: false,
+        rivers: [{
+          ...acquisitionRiver("kaveri"),
+          nisar_products: [{
+            product_id: "NISAR_ONLY_NO_DATA",
+            product_level: "GCOV",
+            polarization: ["HH", "HV"],
+            size_bytes: 10,
+            availability: "downloaded_verified",
+            download_status: "downloaded",
+            hdf5_groups: [],
+            acquisition_start: "2026-11-08T00:00:00Z",
+            processing_status: "no_data",
+            processing_result: {
+              status: "no_valid_corridor_data",
+              valid_pixel_count: 0,
+              corridor_pixel_count: 0,
+              covered_centerline_length_km: 0,
+              reference_centerline_length_km: 1,
+              reference_centerline_coverage_percent: 0,
+              candidate_water_area_m2: null,
+            },
+          }],
+        }],
+      },
+    });
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Impact explorer" }).click();
+  const impact = page.getByRole("region", { name: "Impact explorer" });
+  await expect(impact.getByText("No eligible NISAR candidate is available for the selected river. Candidate metrics are unavailable.")).toBeVisible();
+  await expect(impact.getByText("Unavailable", { exact: true })).toHaveCount(2);
 });

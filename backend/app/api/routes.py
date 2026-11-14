@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import ValidationError
+import rasterio
 
 from app.schemas.acquisitions import (
     AcquisitionJob,
@@ -61,6 +63,13 @@ from app.schemas.validation import (
     ValidationStatus,
     WindowedValidationMetadata,
 )
+from app.schemas.sentinel2 import (
+    Sentinel2ComparisonRequest,
+    Sentinel2ComparisonResponse,
+    Sentinel2ObservationResponse,
+)
+from app.schemas.vegetation_validation import VegetationAssessmentProtocol
+from app.schemas.workspace_report import WorkspaceReportRequest
 from app.services import analysis
 from app.services import acquisitions
 from app.services import acquisition_jobs
@@ -73,7 +82,10 @@ from app.services.nisar_gcov import NisarGcovProcessingUnavailable
 from app.services.catalog import DEMO_OBSERVATIONS, DEMO_REGIONS
 from app.services.rivers import RIVER_CATALOG
 from app.services.satellite import search_satellite_catalog
+from app.services import sentinel2
 from app.services import validation
+from app.services import vegetation_validation
+from app.services import workspace_reports
 
 router = APIRouter(prefix="/api")
 MAX_ANALYSIS_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -193,6 +205,147 @@ async def search_satellite(
 @router.get("/acquisitions", response_model=AcquisitionStatus, tags=["satellite"])
 def get_acquisitions() -> AcquisitionStatus:
     return acquisitions.get_catalog_status()
+
+
+@router.post("/reports/workspace", tags=["reports"])
+def create_workspace_report(request: WorkspaceReportRequest) -> StreamingResponse:
+    try:
+        report, filename = workspace_reports.build_workspace_report(request)
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return StreamingResponse(
+        report,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
+
+
+@router.get(
+    "/sentinel2/observations",
+    response_model=Sentinel2ObservationResponse,
+    tags=["satellite"],
+)
+async def get_sentinel2_observations(
+    river_id: str = Query(description="Supported river corridor."),
+    refresh: bool = Query(default=False),
+    limit: int = Query(default=8, ge=1, le=20),
+) -> Sentinel2ObservationResponse:
+    if river_id not in {river.id for river in RIVER_CATALOG}:
+        raise HTTPException(status_code=422, detail=f"Unsupported river_id: {river_id}")
+    try:
+        payload = await asyncio.to_thread(
+            sentinel2.get_observations,
+            river_id,
+            refresh,
+            limit,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Sentinel-2 discovery or processing is unavailable: {error}",
+        ) from error
+    return Sentinel2ObservationResponse.model_validate(payload)
+
+
+@router.get("/sentinel2/{river_id}/{item_id}/{index_name}/{format_name}", tags=["satellite"])
+def download_sentinel2_index(
+    river_id: str,
+    item_id: str,
+    index_name: Literal["ndvi", "evi", "ndmi"],
+    format_name: Literal["tif", "png"] = "tif",
+    overview: bool = False,
+) -> Response:
+    if river_id not in {river.id for river in RIVER_CATALOG}:
+        raise HTTPException(status_code=404, detail="Unknown river_id.")
+    if "/" in item_id or "\\" in item_id or ".." in item_id:
+        raise HTTPException(status_code=400, detail="Invalid Sentinel-2 item identifier.")
+    path = (sentinel2.DATA_ROOT / river_id / item_id / f"{index_name}.tif").resolve()
+    if sentinel2.DATA_ROOT.resolve() not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="Sentinel-2 index output is unavailable.")
+    if format_name == "png":
+        return Response(
+            content=sentinel2.render_index_png(path, overview=overview),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+    return FileResponse(path, media_type="image/tiff", filename=path.name)
+
+
+@router.post("/sentinel2/index-assessments", status_code=201, tags=["satellite"])
+def create_vegetation_assessment(protocol: VegetationAssessmentProtocol) -> dict:
+    try:
+        return vegetation_validation.create_assessment(protocol)
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(status_code=503, detail="Vegetation assessment storage is unavailable.") from error
+
+
+@router.get("/sentinel2/index-assessments/{assessment_id}", tags=["satellite"])
+def get_vegetation_assessment(assessment_id: str) -> dict:
+    try:
+        return vegetation_validation.get_assessment(assessment_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(status_code=503, detail="Vegetation assessment storage is unavailable.") from error
+
+
+@router.get("/sentinel2/index-assessments/{assessment_id}/reference", tags=["satellite"])
+def get_vegetation_reference(assessment_id: str) -> Response:
+    try:
+        content = vegetation_validation.assessment_reference(assessment_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(status_code=503, detail="Vegetation assessment storage is unavailable.") from error
+    return Response(content=content, media_type="image/tiff")
+
+
+@router.post("/sentinel2/index-assessments/{assessment_id}/evaluate", tags=["satellite"])
+async def evaluate_vegetation_assessment(assessment_id: str, reference_file: UploadFile = File()) -> dict:
+    if not reference_file.filename or Path(reference_file.filename).suffix.casefold() not in {".tif", ".tiff"}:
+        raise HTTPException(status_code=422, detail="Upload a two-band reference GeoTIFF.")
+    try:
+        content = await reference_file.read(vegetation_validation.MAX_UPLOAD_BYTES + 1)
+    finally:
+        await reference_file.close()
+    if len(content) > vegetation_validation.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Reference GeoTIFF exceeds 100 MB.")
+    try:
+        return await asyncio.to_thread(vegetation_validation.evaluate_assessment, assessment_id, content)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(status_code=503, detail="Vegetation assessment storage is unavailable.") from error
+
+
+@router.post(
+    "/sentinel2/comparisons",
+    response_model=Sentinel2ComparisonResponse,
+    tags=["satellite"],
+)
+async def compare_sentinel2_observations(
+    request: Sentinel2ComparisonRequest,
+) -> Sentinel2ComparisonResponse:
+    if request.river_id not in {river.id for river in RIVER_CATALOG}:
+        raise HTTPException(status_code=422, detail=f"Unsupported river_id: {request.river_id}")
+    try:
+        result = await asyncio.to_thread(
+            sentinel2.compare_observations,
+            request.river_id,
+            request.earlier_item_id,
+            request.later_item_id,
+        )
+    except (OSError, ValueError, rasterio.errors.RasterioError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return Sentinel2ComparisonResponse.model_validate(result)
 
 
 @router.post(

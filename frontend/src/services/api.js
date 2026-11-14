@@ -1,5 +1,42 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
 
+export async function downloadWorkspaceReport(context) {
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/reports/workspace`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(context),
+    });
+  } catch {
+    throw new Error("Cannot reach the report service. Check the backend connection and try again.");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(typeof payload?.detail === "string" ? payload.detail : `Report generation failed (${response.status}).`);
+  }
+  if (!response.headers.get("content-type")?.startsWith("application/pdf")) {
+    throw new Error("The report service returned an unexpected file type.");
+  }
+  const blob = await response.blob();
+  const filename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
+  if (!filename || !filename.endsWith(".pdf") || blob.size === 0) {
+    throw new Error("The report service returned an invalid PDF download.");
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  return filename;
+}
+
 async function request(path, { signal, method = "GET", body, headers } = {}) {
   let response;
   try {
@@ -121,6 +158,60 @@ export async function fetchRivers(signal) {
   return rivers;
 }
 
+export async function fetchSentinel2Observations(riverId, { refresh = false, signal } = {}) {
+  const params = new URLSearchParams({
+    river_id: riverId,
+    refresh: String(refresh),
+  });
+  const result = await request(`/api/sentinel2/observations?${params.toString()}`, { signal });
+  if (
+    !result ||
+    result.river_id !== riverId ||
+    result.source !== "Microsoft Planetary Computer" ||
+    result.collection !== "sentinel-2-l2a" ||
+    !Array.isArray(result.observations) ||
+    !result.observations.every((observation) =>
+      observation &&
+      typeof observation.item_id === "string" &&
+      typeof observation.status === "string" &&
+      typeof observation.source === "string" &&
+      observation.collection === "sentinel-2-l2a"
+    )
+  ) {
+    throw new Error("The Sentinel-2 observation API returned an invalid response.");
+  }
+  return result;
+}
+
+export function sentinel2PreviewUrl(riverId, itemId, indexName, { overview = false } = {}) {
+  return `${API_BASE_URL}/api/sentinel2/${encodeURIComponent(riverId)}/${encodeURIComponent(itemId)}/${indexName}/png?render=3${overview ? "&overview=true" : ""}`;
+}
+
+export async function compareSentinel2Observations({ riverId, earlierItemId, laterItemId }, signal) {
+  const result = await request("/api/sentinel2/comparisons", {
+    signal,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      river_id: riverId,
+      earlier_item_id: earlierItemId,
+      later_item_id: laterItemId,
+    }),
+  });
+  if (
+    !result ||
+    result.river_id !== riverId ||
+    result.earlier_item_id !== earlierItemId ||
+    result.later_item_id !== laterItemId ||
+    result.status !== "unvalidated_difference" ||
+    !result.indices ||
+    typeof result.indices !== "object"
+  ) {
+    throw new Error("The Sentinel-2 comparison API returned an invalid response.");
+  }
+  return result;
+}
+
 export async function searchRiverNetwork(filters, signal) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
@@ -137,7 +228,8 @@ export async function searchRiverNetwork(filters, signal) {
 export async function fetchRiverNetworkGeometry(id, signal) {
   const geometry = await request(`/api/river-network/features/${encodeURIComponent(id)}/geometry`, { signal });
   if (!geometry || !["LineString", "MultiLineString"].includes(geometry.type) ||
-      !Array.isArray(geometry.coordinates)) {
+      !Array.isArray(geometry.coordinates) ||
+      (geometry.pilot_match != null && !["kaveri", "tungabhadra"].includes(geometry.pilot_match.river_id))) {
     throw new Error("The river network API returned invalid geometry.");
   }
   return geometry;

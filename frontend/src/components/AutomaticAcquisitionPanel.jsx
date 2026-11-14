@@ -62,6 +62,25 @@ function stateLabel(state) {
   })[state] ?? state;
 }
 
+function nisarProcessingLabel(product) {
+  if (product.processing_result?.status === "unvalidated_candidate") {
+    return "Processed — scientifically unvalidated candidate";
+  }
+  if (product.processing_result?.status === "no_valid_corridor_data" || product.processing_status === "no_data") {
+    return "No valid corridor data";
+  }
+  if (product.processing_status === "processed") {
+    return "Processed — result details unavailable";
+  }
+  return `Processing status: ${String(product.processing_status ?? "unknown").replaceAll("_", " ")}`;
+}
+
+function nisarSourceLabel(product) {
+  return product.local_path
+    ? "Source: locally recovered NISAR L2 UR GCOV product"
+    : "Source: NISAR L2 UR GCOV catalog record";
+}
+
 function earthdataAuthenticationLabel(status) {
   return ({
     unknown: "unknown",
@@ -449,7 +468,8 @@ export default function AutomaticAcquisitionPanel({
                   )}
                   {product.download_status === "downloaded" && (
                     <div className="nisar-processing">
-                      <strong>NISAR GCOV candidate processing · {product.processing_status.replaceAll("_", " ")}</strong>
+                      <strong>{nisarProcessingLabel(product)}</strong>
+                      <small>{nisarSourceLabel(product)}</small>
                       {product.processing_message && <small>{product.processing_message}</small>}
                       {!product.processing_result && (
                         <button
@@ -720,7 +740,7 @@ export default function AutomaticAcquisitionPanel({
                   <div className="acquisition-observation-heading">
                     <CheckCircle2 size={15} />
                     <strong>{observation.platform ?? "Sentinel-1"} · GRD RTC · {observation.polarization}</strong>
-                    <span>UNVALIDATED CANDIDATE</span>
+                    <span>Satellite observation · unvalidated analytical candidate</span>
                   </div>
                   <p className="acquisition-product-id">{observation.product_id}</p>
                   <div className="acquisition-metadata-grid">

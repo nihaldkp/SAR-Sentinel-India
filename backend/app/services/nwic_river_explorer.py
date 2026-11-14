@@ -2,7 +2,17 @@ import json
 import sqlite3
 from typing import Any
 
+from rasterio.warp import transform_geom
+from shapely.geometry import shape
+
 from app.services.acquisitions import _catalog_connection
+from app.services.rivers import RIVER_CATALOG
+
+PILOT_SOURCE_SHA256 = "e360257af967e954efb87d3172b0c74a813a05f82fef3a5e404973357d57bf06"
+PILOT_SOURCE_IDENTITIES = {
+    "245": ("2912", "Tungabhadra River", "Krishna", "tungabhadra"),
+    "548": ("6983", "Cauvery River", "Cauvery", "kaveri"),
+}
 
 
 def _literal_like(value: str) -> str:
@@ -40,7 +50,13 @@ def search_features(
     join = " JOIN nwic_river_bounds b ON b.row_id=f.row_id" if bbox else ""
     with _catalog_connection() as connection:
         if not _available(connection):
-            return {"total": 0, "limit": limit, "offset": offset, "features": []}
+            return {"source_status": "not_imported", "total": 0, "limit": limit, "offset": offset, "features": []}
+        import_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nwic_imports'"
+        ).fetchone()
+        completed = connection.execute(
+            "SELECT completed FROM nwic_imports ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone() if import_table else None
         total = connection.execute(
             "SELECT count(*) FROM nwic_river_features f" + join + where, parameters
         ).fetchone()[0]
@@ -53,6 +69,7 @@ def search_features(
             [*parameters, limit, offset],
         ).fetchall()
     return {
+        "source_status": "available", "import_complete": bool(completed and completed["completed"]),
         "total": total, "limit": limit, "offset": offset,
         "features": [
             {**dict(row), "source": "CWC/NWIC River Network", "geometry_available": True,
@@ -67,7 +84,29 @@ def feature_geometry(source_object_id: str) -> dict[str, Any] | None:
         if not _available(connection):
             return None
         row = connection.execute(
-            "SELECT geometry_json FROM nwic_river_features WHERE source_object_id=?",
+            "SELECT geometry_json, source_river_id, name, basin, source_version, input_sha256 "
+            "FROM nwic_river_features WHERE source_object_id=?",
             (source_object_id,),
         ).fetchone()
-    return json.loads(row["geometry_json"]) if row else None
+    if not row:
+        return None
+    geometry = json.loads(row["geometry_json"])
+    identity = PILOT_SOURCE_IDENTITIES.get(source_object_id)
+    if (identity and row["input_sha256"] == PILOT_SOURCE_SHA256
+            and row["source_version"] == "2025-11-17"
+            and (row["source_river_id"], row["name"], row["basin"]) == identity[:3]):
+        river = next((item for item in RIVER_CATALOG if item.id == identity[3]), None)
+        if river is not None:
+            nwic_line = shape(transform_geom("EPSG:4326", "EPSG:32643", geometry))
+            pilot_line = shape(transform_geom("EPSG:4326", "EPSG:32643", river.centerline.model_dump()))
+            if nwic_line.length and pilot_line.length:
+                nwic_overlap = min(1.0, nwic_line.intersection(pilot_line.buffer(1500)).length / nwic_line.length)
+                pilot_overlap = min(1.0, pilot_line.intersection(nwic_line.buffer(1500)).length / pilot_line.length)
+                if nwic_overlap >= 0.95 and pilot_overlap >= 0.95:
+                    geometry["pilot_match"] = {
+                        "river_id": identity[3],
+                        "method": "Verified source identity and at least 95% mutual centerline overlap within 1,500 m in EPSG:32643.",
+                        "nwic_overlap_fraction": nwic_overlap,
+                        "pilot_overlap_fraction": pilot_overlap,
+                    }
+    return geometry

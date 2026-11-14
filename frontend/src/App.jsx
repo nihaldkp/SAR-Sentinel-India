@@ -1,7 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import createPlotlyComponent from "react-plotly.js/factory";
-import Plotly from "plotly.js/lib/core";
-import scatter from "plotly.js/lib/scatter";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -12,7 +9,6 @@ import {
   CircleHelp,
   Clock3,
   CloudRain,
-  Compass,
   Crosshair,
   Download,
   Droplets,
@@ -28,23 +24,21 @@ import {
   X,
 } from "lucide-react";
 import {
-  Circle,
   GeoJSON,
   ImageOverlay,
   MapContainer,
-  Polygon,
   Polyline,
-  Popup,
   TileLayer,
-  Tooltip,
   useMap,
 } from "react-leaflet";
 import {
   API_BASE_URL,
+  compareSentinel2Observations,
+  downloadWorkspaceReport,
   fetchAutomaticAcquisitions,
-  fetchCatalog,
-  fetchObservations,
+  fetchSentinel2Observations,
   fetchRivers,
+  sentinel2PreviewUrl,
 } from "./services/api.js";
 import SatelliteSearchPanel from "./components/SatelliteSearchPanel.jsx";
 import AnalysisWorkspace from "./components/AnalysisWorkspace.jsx";
@@ -53,81 +47,6 @@ import AIAnalysisPanel from "./components/AIAnalysisPanel.jsx";
 import ValidationWorkspace from "./components/ValidationWorkspace.jsx";
 import RiverNetworkExplorer from "./components/RiverNetworkExplorer.jsx";
 
-Plotly.register([scatter]);
-const Plot = createPlotlyComponent(Plotly);
-
-const regions = {
-  "Krishna basin · Karnataka": {
-    center: [15.72, 75.72],
-    zoom: 7,
-    extent: "North Karnataka, India",
-    analyzed: "2,480 km²",
-    changed: "126 km²",
-    changePercent: 5.1,
-    sites: 18,
-    outline: [
-      [16.55, 74.72],
-      [16.68, 76.22],
-      [15.98, 77.34],
-      [14.96, 77.13],
-      [14.82, 75.74],
-      [15.35, 74.78],
-    ],
-    changes: [
-      { center: [16.12, 75.74], radius: 8500, area: "34 km²", confidence: "Illustrative" },
-      { center: [15.66, 76.2], radius: 11000, area: "51 km²", confidence: "Illustrative" },
-      { center: [15.18, 75.76], radius: 7000, area: "22 km²", confidence: "Illustrative" },
-      { center: [16.24, 76.68], radius: 5900, area: "19 km²", confidence: "Illustrative" },
-    ],
-  },
-  "Godavari basin · Telangana": {
-    center: [18.02, 80.2],
-    zoom: 7,
-    extent: "Northern Telangana, India",
-    analyzed: "1,960 km²",
-    changed: "94 km²",
-    changePercent: 4.8,
-    sites: 13,
-    outline: [
-      [18.84, 79.18],
-      [18.9, 80.74],
-      [18.18, 81.37],
-      [17.32, 80.82],
-      [17.34, 79.57],
-      [18.02, 79.12],
-    ],
-    changes: [
-      { center: [18.42, 79.96], radius: 9000, area: "36 km²", confidence: "Illustrative" },
-      { center: [17.92, 80.48], radius: 10000, area: "41 km²", confidence: "Illustrative" },
-      { center: [17.62, 79.87], radius: 6200, area: "17 km²", confidence: "Illustrative" },
-    ],
-  },
-  "Mahanadi basin · Odisha": {
-    center: [20.48, 84.12],
-    zoom: 7,
-    extent: "Western Odisha, India",
-    analyzed: "2,130 km²",
-    changed: "108 km²",
-    changePercent: 5.1,
-    sites: 16,
-    outline: [
-      [21.23, 83.19],
-      [21.3, 84.63],
-      [20.76, 85.34],
-      [19.88, 84.89],
-      [19.78, 83.87],
-      [20.31, 83.22],
-    ],
-    changes: [
-      { center: [20.94, 84.08], radius: 9000, area: "39 km²", confidence: "Illustrative" },
-      { center: [20.38, 84.67], radius: 10500, area: "48 km²", confidence: "Illustrative" },
-      { center: [20.04, 83.91], radius: 6800, area: "21 km²", confidence: "Illustrative" },
-    ],
-  },
-};
-
-const DEFAULT_REGION_ID = "krishna-karnataka";
-const DEFAULT_REGION_NAME = "Krishna basin · Karnataka";
 function toLeafletPolyline(geojsonCoordinates) {
   if (!Array.isArray(geojsonCoordinates)) {
     return [];
@@ -158,6 +77,26 @@ function renderRiverSegments(river, geometryKey, color, active, weight = 4) {
   ));
 }
 
+function buildRealMapRegion(rivers, riverSelection) {
+  const activeRivers = riverSelection === "both"
+    ? rivers
+    : rivers.filter((river) => river.id === riverSelection);
+  const points = activeRivers.flatMap((river) => flattenRiverSegments(river.centerline));
+  if (!points.length) {
+    return { center: [15.72, 75.72], zoom: 6, extent: "Registered river geometry unavailable" };
+  }
+  const latitudes = points.map(([latitude]) => latitude);
+  const longitudes = points.map(([, longitude]) => longitude);
+  return {
+    center: [
+      (Math.min(...latitudes) + Math.max(...latitudes)) / 2,
+      (Math.min(...longitudes) + Math.max(...longitudes)) / 2,
+    ],
+    zoom: activeRivers.length > 1 ? 6 : 8,
+    extent: activeRivers.map((river) => river.display_name).join(" · "),
+  };
+}
+
 const navigation = [
   { label: "Overview", icon: BarChart3 },
   { label: "Map explorer", icon: Map },
@@ -172,11 +111,19 @@ const secondaryNavigation = [
   { label: "Data & methodology", icon: BookOpen },
   { label: "About the project", icon: CircleHelp },
 ];
+const NO_REAL_MEASUREMENT = "Real observation unavailable — no validated measurement available.";
+const LEGACY_DEMONSTRATION_MODE = false;
 
 function MapViewport({ region, rivers, riverSelection, selectedFootprint, selectedAnalysisLayer, selectedOpticalLayer, selectedNetworkFeature }) {
   const map = useMap();
   const [regionLatitude, regionLongitude] = region.center;
   const regionZoom = region.zoom;
+
+  useEffect(() => {
+    const observer = new ResizeObserver(() => map.invalidateSize({ pan: false }));
+    observer.observe(map.getContainer());
+    return () => observer.disconnect();
+  }, [map]);
 
   useEffect(() => {
     if (selectedNetworkFeature?.geometry?.coordinates) {
@@ -299,6 +246,7 @@ function OpticalRasterOverlay({ layer }) {
 function Sidebar({ activePage, onNavigate, open, onClose }) {
   const renderLink = ({ label, icon: Icon }) => (
     <button
+      aria-current={activePage === label ? "page" : undefined}
       className={`nav-link ${activePage === label ? "nav-link-active" : ""}`}
       key={label}
       onClick={() => {
@@ -326,11 +274,13 @@ function Sidebar({ activePage, onNavigate, open, onClose }) {
           <button aria-label="Close menu" className="icon-button sidebar-close" onClick={onClose} type="button"><X size={18} /></button>
         </div>
 
-        <div className="sidebar-label">WORKSPACE</div>
-        <nav aria-label="Main navigation" className="nav-stack">{navigation.map(renderLink)}</nav>
+        <div className="sidebar-nav-scroll">
+          <div className="sidebar-label">WORKSPACE</div>
+          <nav aria-label="Main navigation" className="nav-stack">{navigation.map(renderLink)}</nav>
 
-        <div className="sidebar-label secondary-label">PROJECT</div>
-        <nav aria-label="Project navigation" className="nav-stack">{secondaryNavigation.map(renderLink)}</nav>
+          <div className="sidebar-label secondary-label">PROJECT</div>
+          <nav aria-label="Project navigation" className="nav-stack">{secondaryNavigation.map(renderLink)}</nav>
+        </div>
 
         <div className="sidebar-bottom">
           <div className="mission-mini">
@@ -390,20 +340,34 @@ function evidenceProducts(catalog, riverSelection) {
     ));
 }
 
+function evidenceSources(catalog, riverSelection) {
+    const rivers = (catalog?.rivers ?? []).filter((river) => (
+      riverSelection === "both" || river.river_id === riverSelection
+    ));
+    return {
+      nisarProducts: rivers.flatMap((river) => river.nisar_products ?? []),
+      sentinelObservations: rivers.flatMap((river) => river.observations ?? []),
+    };
+}
+
 function EvidenceProductRow({ product }) {
   const result = product.processing_result;
   const status = result?.status ?? product.processing_status ?? product.download_status;
   const isCandidate = status === "unvalidated_candidate";
   const isNoData = status === "no_valid_corridor_data" || product.processing_status === "no_data";
+  const isFailure = status === "failed" || status === "processing_failed" || status === "error";
   return (
     <article className="evidence-product">
       <div className="evidence-product-heading">
         <div>
-          <strong>{product.product_id}</strong>
+          <strong className="evidence-product-id">{product.product_id}</strong>
           <span>{product.river_id} · {formatEvidenceDate(product.acquisition_start)}</span>
+          <span className="evidence-product-source">
+            {product.local_path ? "Recovered locally · NISAR L2 UR GCOV acquisition" : "NISAR L2 UR GCOV catalog acquisition"}
+          </span>
         </div>
         <span className={`evidence-status ${isCandidate ? "evidence-status-candidate" : isNoData ? "evidence-status-empty" : ""}`}>
-          {isCandidate ? "Candidate only" : isNoData ? "No usable corridor data" : String(status ?? "Not processed").replaceAll("_", " ")}
+          {isCandidate ? "Processed — unvalidated candidate" : isNoData ? "Processed — no usable corridor data" : isFailure ? "Processing failed" : String(status ?? "Not processed").replaceAll("_", " ")}
         </span>
       </div>
       {isCandidate && result ? (
@@ -416,8 +380,10 @@ function EvidenceProductRow({ product }) {
         </div>
       ) : isNoData && result ? (
         <p className="evidence-note">
-          No candidate mask was generated because {formatEvidenceNumber(result.valid_pixel_count, 0)} valid paired HH/HV pixels were available in {formatEvidenceNumber(result.corridor_pixel_count, 0)} corridor pixels.
+          No candidate mask was generated because {formatEvidenceNumber(result.valid_pixel_count, 0)} valid paired HH/HV pixels were available in {formatEvidenceNumber(result.corridor_pixel_count, 0)} corridor pixels. This is a processing outcome, not a failed satellite acquisition.
         </p>
+      ) : isFailure ? (
+        <p className="evidence-note">Processing failed; no candidate measurement is available for this acquisition.</p>
       ) : (
         <p className="evidence-note">The product is recorded locally but processing has not produced a usable result.</p>
       )}
@@ -443,27 +409,90 @@ function AcquisitionEvidence({ catalog, status, error, riverSelection }) {
   );
 }
 
+function SentinelObservationEvidence({ catalog, status, error, riverSelection }) {
+  const { sentinelObservations } = evidenceSources(catalog, riverSelection);
+  if (status === "loading") {
+    return <div className="workspace-empty" role="status">Loading Sentinel-1 observations…</div>;
+  }
+  if (status === "error") {
+    return <div className="workspace-empty workspace-empty-error" role="alert">{error}</div>;
+  }
+  if (!sentinelObservations.length) {
+    return <div className="workspace-empty">No Sentinel-1 observation is available for the selected river.</div>;
+  }
+  return (
+    <div className="evidence-list">
+      {sentinelObservations.map((observation) => {
+        const isCandidate = observation.processing_status === "unvalidated_candidate";
+        const isNoData = observation.processing_status === "no_data";
+        return (
+          <article className="evidence-product" key={observation.product_id}>
+            <div className="evidence-product-heading">
+              <div>
+                <strong className="evidence-product-id">{observation.product_id}</strong>
+                <span>{formatEvidenceDate(observation.acquisition_start)} · {observation.polarization ?? "Polarization unavailable"}</span>
+                <span className="evidence-product-source">{observation.source ?? "Sentinel-1 source unavailable"} · {observation.product_type ?? "Product type unavailable"}</span>
+              </div>
+              <span className={`evidence-status ${isCandidate ? "evidence-status-candidate" : isNoData ? "evidence-status-empty" : ""}`}>
+                {isCandidate ? "Processed — scientifically unvalidated candidate" : isNoData ? "No valid data" : String(observation.processing_status ?? "Unavailable").replaceAll("_", " ")}
+              </span>
+            </div>
+            {isCandidate ? (
+              <div className="evidence-facts">
+                <span>Valid pixels <strong>{formatEvidenceNumber(observation.valid_pixel_count, 0)}</strong> ({formatEvidenceNumber((observation.valid_data_fraction ?? 0) * 100, 1)}%)</span>
+                <span>Candidate pixels <strong>{formatEvidenceNumber(observation.water_pixel_count, 0)}</strong></span>
+                <span>Candidate area <strong>{formatEvidenceNumber(observation.candidate_water_area_m2 / 1_000_000, 4)} km²</strong></span>
+                <span>Coverage <strong>{formatEvidenceNumber(observation.centerline_coverage_percent, 2)}%</strong></span>
+              </div>
+            ) : (
+              <p className="evidence-note">No candidate measurement is available for this observation.</p>
+            )}
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
 function ImpactExplorer({ catalog, status, error, riverSelection }) {
   const products = evidenceProducts(catalog, riverSelection);
-  const candidates = products.filter((product) => product.processing_result?.status === "unvalidated_candidate");
-  const validPixels = candidates.reduce((sum, product) => sum + (product.processing_result?.valid_pixel_count ?? 0), 0);
-  const candidateArea = candidates.reduce((sum, product) => sum + (product.processing_result?.candidate_water_area_m2 ?? 0), 0);
+  const candidates = products
+    .filter((product) => (
+      product.processing_result?.status === "unvalidated_candidate" &&
+      Number.isFinite(product.processing_result.valid_pixel_count) &&
+      Number.isFinite(product.processing_result.candidate_water_area_m2)
+    ))
+    .sort((left, right) => (
+      new Date(right.acquisition_start ?? 0).getTime() - new Date(left.acquisition_start ?? 0).getTime()
+    ));
+  const selectedCandidate = candidates[0];
+  const selectedResult = selectedCandidate?.processing_result;
   const metricsReady = status === "loaded";
   return (
     <section className="workspace-section" aria-label="Impact explorer">
       <div className="workspace-heading">
         <div>
           <div className="eyebrow"><span className="eyebrow-line" /> REAL ACQUISITION EVIDENCE</div>
-          <h1>Impact explorer</h1>
+          <h2>Impact explorer</h2>
           <p>Locally recovered NISAR GCOV observations and their exploratory corridor-level processing outputs.</p>
         </div>
         <span className="evidence-disclosure">Candidate classifications · not validated impact</span>
       </div>
       <div className="workspace-metrics">
         <MetricCard icon={Satellite} label="Recovered products" value={metricsReady ? String(products.length) : "Not available"} note="NISAR GCOV records" tone="blue" />
-        <MetricCard icon={Crosshair} label="Valid pixels" value={metricsReady ? formatEvidenceNumber(validPixels, 0) : "Not available"} note="candidate outputs only" tone="teal" />
-        <MetricCard icon={Droplets} label="Candidate area" value={metricsReady ? `${formatEvidenceNumber(candidateArea, 1)} m²` : "Not available"} note="not flood extent" tone="amber" />
+        <MetricCard icon={Crosshair} label="Valid pixels" value={metricsReady && selectedResult ? formatEvidenceNumber(selectedResult.valid_pixel_count, 0) : "Unavailable"} note="selected candidate only" tone="teal" />
+        <MetricCard icon={Droplets} label="Candidate area" value={metricsReady && selectedResult ? `${formatEvidenceNumber(selectedResult.candidate_water_area_m2, 1)} m²` : "Unavailable"} note="not flood extent" tone="amber" />
       </div>
+      {metricsReady && selectedCandidate ? (
+        <div className="comparison-callout" aria-label="Selected impact candidate">
+          <strong>Selected acquisition:</strong>{" "}
+          {selectedCandidate.product_id} · {formatEvidenceDate(selectedCandidate.acquisition_start)} ·{" "}
+          {selectedCandidate.local_path ? "Recovered locally · NISAR L2 UR GCOV" : "NISAR L2 UR GCOV catalog record"} ·{" "}
+          Processed — scientifically unvalidated candidate. Historical acquisitions and Sentinel-1 records are not included in these metrics.
+        </div>
+      ) : metricsReady ? (
+        <div className="workspace-empty" role="status">No eligible NISAR candidate is available for the selected river. Candidate metrics are unavailable.</div>
+      ) : null}
       <div className="panel workspace-panel">
         <div className="panel-header">
           <div><h2>Acquisition evidence</h2><p className="panel-subtitle">A_009 and A_010 remain separate observations with separate processing outcomes.</p></div>
@@ -477,7 +506,7 @@ function ImpactExplorer({ catalog, status, error, riverSelection }) {
 function ChangeAnalysis({ catalog, status, error, riverSelection }) {
   const products = evidenceProducts(catalog, riverSelection);
   const candidates = products.filter((product) => product.processing_result?.status === "unvalidated_candidate");
-  const compatibleCandidates = candidates.length > 1 && new Set(
+  const matchingGridMetadata = candidates.length > 1 && new Set(
     candidates.map((product) => `${product.processing_result.input_crs}:${product.processing_result.pixel_size_m}`),
   ).size === 1;
   return (
@@ -485,7 +514,7 @@ function ChangeAnalysis({ catalog, status, error, riverSelection }) {
       <div className="workspace-heading">
         <div>
           <div className="eyebrow"><span className="eyebrow-line" /> TEMPORAL EVIDENCE</div>
-          <h1>Change analysis</h1>
+          <h2>Change analysis</h2>
           <p>Available acquisition dates and processing states are shown without inventing a change percentage.</p>
         </div>
         <span className="evidence-disclosure">No unvalidated change claim</span>
@@ -497,13 +526,151 @@ function ChangeAnalysis({ catalog, status, error, riverSelection }) {
         <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
         {status === "loaded" && (
           <div className="comparison-callout">
-            {compatibleCandidates
-              ? "Compatible candidate masks are available, but this dashboard does not calculate a change percentage."
-              : "A comparable pair is not available: the recovered observations include one candidate result and/or a no-data result, so no change percentage is calculated."}
+            {matchingGridMetadata
+              ? "Some candidates share declared CRS and resolution, but spatial overlap and comparison compatibility have not been established here. No change percentage is calculated."
+              : "Change detection is unavailable because two compatible candidate masks are required; no change percentage is calculated."}
           </div>
         )}
       </div>
     </section>
+  );
+}
+
+function RealOverview({
+  catalog,
+  status,
+  error,
+  riverSelection,
+  rivers,
+  riverLayers,
+  riverStatus,
+  riverError,
+  selectedObservation,
+  selectedFootprint,
+  selectedAnalysisLayer,
+  selectedOpticalLayer,
+  selectedNetworkFeature,
+  onToggleRiverLayer,
+  onSelectAnalysisGeometry,
+  onToggleOpticalLayer,
+  onSelectNetworkFeature,
+  cancelNetworkSelection,
+  mapFocused,
+}) {
+  const { nisarProducts, sentinelObservations } = evidenceSources(catalog, riverSelection);
+  const candidateNisarProducts = nisarProducts.filter((product) => product.processing_result?.status === "unvalidated_candidate");
+  const candidateSentinelObservations = sentinelObservations.filter((observation) => observation.processing_status === "unvalidated_candidate");
+  const processedCandidates = candidateNisarProducts.length + candidateSentinelObservations.length;
+  const candidateRecords = [
+    ...candidateNisarProducts.map((product) => ({
+      acquisition_start: product.acquisition_start,
+      candidatePixels: product.processing_result?.water_pixel_count,
+      candidateAreaM2: product.processing_result?.candidate_water_area_m2,
+    })),
+    ...candidateSentinelObservations.map((observation) => ({
+      acquisition_start: observation.acquisition_start,
+      candidatePixels: observation.water_pixel_count,
+      candidateAreaM2: observation.candidate_water_area_m2,
+    })),
+  ].sort((left, right) => (
+    new Date(right.acquisition_start ?? 0).getTime() - new Date(left.acquisition_start ?? 0).getTime()
+  ));
+  const latestCandidate = candidateRecords[0];
+  const candidatePixels = latestCandidate?.candidatePixels;
+  const candidateAreaM2 = latestCandidate?.candidateAreaM2;
+  const catalogObservationCount = nisarProducts.length + sentinelObservations.length;
+  const candidateArea = processedCandidates > 0 && Number.isFinite(candidateAreaM2) && candidateAreaM2 > 0
+    ? `${formatEvidenceNumber(candidateAreaM2 / 1_000_000, 4)} km²`
+    : "Unavailable";
+  const region = buildRealMapRegion(rivers, riverSelection);
+  const visibleRivers = riverSelection === "both"
+    ? rivers
+    : rivers.filter((river) => river.id === riverSelection);
+
+  return (
+    <>
+      <section aria-label="Real satellite overview" className="metrics-grid">
+        <MetricCard icon={Satellite} label="Catalog observations" value={status === "loaded" ? String(catalogObservationCount) : NO_REAL_MEASUREMENT} note="NISAR + Sentinel-1 records" tone="blue" />
+        <MetricCard icon={Activity} label="Processed candidates" value={status === "loaded" ? String(processedCandidates) : NO_REAL_MEASUREMENT} note="unvalidated candidate results" tone="amber" />
+        <MetricCard icon={Crosshair} label="Latest candidate pixels" value={status === "loaded" && Number.isFinite(candidatePixels) ? formatEvidenceNumber(candidatePixels, 0) : "Unavailable"} note="unvalidated water classification" tone="teal" />
+        <MetricCard icon={Droplets} label="Latest candidate area" value={status === "loaded" ? candidateArea : NO_REAL_MEASUREMENT} note="not validated inundation" tone="slate" />
+      </section>
+
+      <section className={`analysis-grid ${mapFocused ? "map-focused" : ""}`}>
+        <article className="panel map-panel">
+          <div className="panel-header map-panel-header">
+            <div>
+              <div className="panel-title-row"><h2>Satellite evidence map</h2><span className="panel-live-tag"><span /> REAL DATA ONLY</span></div>
+              <p className="panel-subtitle">{region.extent}</p>
+              <p className="panel-subtitle">Registered river geometry and selected georeferenced evidence layers are shown when available.</p>
+              <p className="panel-subtitle">A registered centerline does not establish monitoring coverage.</p>
+            </div>
+            <div className="river-layer-controls">
+              <button aria-pressed={riverLayers.centerline} className={riverLayers.centerline ? "river-layer-button active" : "river-layer-button"} onClick={() => onToggleRiverLayer("centerline")} type="button">Centerline</button>
+              <button aria-pressed={riverLayers.leftBank} className={riverLayers.leftBank ? "river-layer-button active" : "river-layer-button"} disabled={riverStatus !== "loaded"} onClick={() => onToggleRiverLayer("leftBank")} type="button">Left bank</button>
+              <button aria-pressed={riverLayers.rightBank} className={riverLayers.rightBank ? "river-layer-button active" : "river-layer-button"} disabled={riverStatus !== "loaded"} onClick={() => onToggleRiverLayer("rightBank")} type="button">Right bank</button>
+            </div>
+          </div>
+          {riverStatus === "loading" && <div className="river-data-status" role="status">Loading registered river geometry…</div>}
+          {riverStatus === "error" && <div className="river-data-error" role="alert">River geometry could not be loaded: {riverError}</div>}
+          <div className="map-frame">
+            <ChangeMap
+              region={region}
+              layer="real-observations"
+              onSelectChange={() => {}}
+              rivers={rivers}
+              riverSelection={riverSelection}
+              riverLayers={riverLayers}
+              selectedObservation={selectedObservation}
+              selectedFootprint={selectedFootprint}
+              selectedAnalysisLayer={selectedAnalysisLayer}
+              selectedOpticalLayer={selectedOpticalLayer}
+              selectedNetworkFeature={selectedNetworkFeature}
+            />
+            <div className="map-legend">
+              <div className="legend-title">MAP KEY · REAL SOURCES</div>
+              {riverLayers.centerline && visibleRivers.map((river) => (
+                <div className="legend-item" key={`real-river-legend-${river.id}`}>
+                  <span className={`legend-swatch ${river.id === "kaveri" ? "kaveri-swatch" : "tungabhadra-swatch"}`} />
+                  {river.name} · OSM
+                </div>
+              ))}
+              {riverLayers.leftBank && <div className="legend-item legend-item-muted">{visibleRivers.some((river) => river.left_bank_boundary) ? "Left bank boundary" : "Left bank boundary data unavailable"}</div>}
+              {riverLayers.rightBank && <div className="legend-item legend-item-muted">{visibleRivers.some((river) => river.right_bank_boundary) ? "Right bank boundary" : "Right bank boundary data unavailable"}</div>}
+              {selectedFootprint && <div className="legend-item"><span className="legend-swatch footprint-swatch" />{selectedObservation?.mission ?? "Satellite"} footprint · metadata only</div>}
+              {selectedNetworkFeature && <div className="legend-item">NWIC: {selectedNetworkFeature.name || "Unnamed feature"} · registered, monitoring unknown</div>}
+              {selectedAnalysisLayer && (
+                <>
+                  <div className="legend-item"><span className="legend-swatch analysis-water-swatch" />Candidate water · unvalidated</div>
+                  <div className="legend-item"><span className="legend-swatch analysis-coverage-swatch" />Candidate polygons only · outside not shown</div>
+                </>
+              )}
+              {selectedOpticalLayer && (
+                <>
+                  <div className="legend-item"><span className="legend-swatch optical-candidate-swatch" />Candidate water · exploratory</div>
+                  <div className="legend-item"><span className="legend-swatch optical-noncandidate-swatch" />Not classified as candidate</div>
+                  <div className="legend-item"><span className="legend-swatch optical-nodata-swatch" />NoData / invalid / unavailable</div>
+                  <div className="optical-map-warning">EXPLORATORY SENTINEL-2 NDWI OUTPUT — NOT GROUND TRUTH.</div>
+                </>
+              )}
+              {!selectedFootprint && !selectedAnalysisLayer && !selectedOpticalLayer && (
+                <div className="legend-item legend-item-muted">Select a persisted acquisition or processed output to display its georeferenced layer.</div>
+              )}
+            </div>
+            <div className="map-attribution-note">River geometry: OpenStreetMap contributors · satellite layers: persisted product outputs when selected</div>
+          </div>
+        </article>
+
+        <article className="panel workspace-panel">
+          <div className="panel-header">
+            <div><h2>Observation evidence</h2><p className="panel-subtitle">Actual acquisition metadata and processing outcomes from the backend catalog.</p></div>
+          </div>
+          <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
+        </article>
+      </section>
+
+      <RiverNetworkExplorer selected={selectedNetworkFeature} cancelSelectionRef={cancelNetworkSelection} onSelect={onSelectNetworkFeature} />
+    </>
   );
 }
 
@@ -513,11 +680,13 @@ function MethodologySection() {
     ["HH/HV processing", "Frequency-A HHHH and HVHV gamma0 linear-power datasets are read with the product validity mask and mapped river corridor."],
     ["Candidate thresholding", "Power is converted with 10*log10(max(power, 1e-6)); independent 900-bin Otsu thresholds classify pixels where both HH and HV are below threshold."],
     ["Outputs and metadata", "The pipeline writes a NoData-preserving candidate mask GeoTIFF, two-band measurement GeoTIFF, display-only GeoJSON, and processing metadata."],
+    ["Sentinel-1 RTC workflow", "The application reads real Sentinel-1 RTC VV calibrated linear-intensity COG pixels from Microsoft Planetary Computer inside a 3,000 m OSM centerline corridor. Upstream Catalyst RTC radiometric calibration and terrain correction are recorded as provenance; this application does not repeat those upstream steps."],
+    ["Sentinel-1 classification limits", "The shared processing converts positive linear power to dB, applies the implemented 5x5 Lee local-statistic filter, estimates an independent Otsu threshold, and writes NoData-preserving candidate outputs. Valid-pixel support and centerline coverage are persisted; the result is an unvalidated candidate, not a validated water or flood measurement."],
   ];
   return (
     <section className="workspace-section" aria-label="Data and methodology">
       <div className="workspace-heading">
-        <div><div className="eyebrow"><span className="eyebrow-line" /> REPRODUCIBLE PIPELINE</div><h1>Data & methodology</h1><p>Implemented processing steps and the boundaries of what the outputs mean.</p></div>
+        <div><div className="eyebrow"><span className="eyebrow-line" /> REPRODUCIBLE PIPELINE</div><h2>Data & methodology</h2><p>Implemented processing steps and the boundaries of what the outputs mean.</p></div>
       </div>
       <div className="methodology-grid">
         {steps.map(([title, description], index) => (
@@ -536,46 +705,322 @@ function AboutSection() {
   return (
     <section className="workspace-section" aria-label="About the project">
       <div className="workspace-heading">
-        <div><div className="eyebrow"><span className="eyebrow-line" /> NASA SPACE APPS CHALLENGE 2026</div><h1>About the project</h1><p>Understanding Indian rivers through openly documented satellite observation workflows.</p></div>
+        <div><div className="eyebrow"><span className="eyebrow-line" /> NASA SPACE APPS CHALLENGE 2026</div><h2>About the project</h2><p>Understanding Indian rivers through openly documented satellite observation workflows.</p></div>
       </div>
       <div className="about-grid">
         <article className="panel about-card"><h2>Purpose</h2><p>SAR Sentinel India helps teams inspect river and water-body observations, connect them to mapped river corridors, and hand reproducible candidate outputs to GIS analysts.</p></article>
         <article className="panel about-card"><h2>Supported observations</h2><p>The application supports NISAR GCOV acquisition and candidate processing, Sentinel-1 RTC acquisition and candidate analysis, and OpenStreetMap river centerline context where records are available.</p></article>
-        <article className="panel about-card"><h2>Current capability</h2><p>Real product records, processing metadata, masks, measurements, and display polygons can be inspected separately from the dashboard's illustrative overview layers.</p></article>
+        <article className="panel about-card"><h2>Current capability</h2><p>Real product records, processing metadata, masks, measurements, and display polygons can be inspected. Overview metrics are derived from the selected river's persisted acquisition records; unavailable measurements are not replaced with illustrative values.</p></article>
         <article className="panel about-card"><h2>Responsible interpretation</h2><p>Outputs labeled candidate or unvalidated are not verified inundation, damage, river boundaries, erosion, deposition, or environmental measurements. Independent GIS and scientific review remains necessary.</p></article>
       </div>
     </section>
   );
 }
 
-function LandMonitoringSection({ title, eyebrow, description, catalog, status, error, riverSelection, domain }) {
-  const products = evidenceProducts(catalog, riverSelection);
-  const hasSentinelObservations = (catalog?.rivers ?? [])
-    .filter((river) => riverSelection === "both" || river.river_id === riverSelection)
-    .some((river) => (river.observations ?? []).length > 0);
-  const sourceSummary = status === "loading"
-    ? "Loading the acquisition catalog."
-    : status === "error"
-      ? "The acquisition catalog could not be loaded."
-      : products.length || hasSentinelObservations
-    ? "Satellite records are available for inspection, but this catalog does not contain a vegetation-index product."
-    : "No compatible satellite observation is currently available for the selected river.";
+function Sentinel2MapViewport({ bounds }) {
+  const map = useMap();
+  useEffect(() => {
+    if (bounds) {
+      map.fitBounds([[bounds.south, bounds.west], [bounds.north, bounds.east]], { padding: [18, 18] });
+    }
+  }, [bounds, map]);
+  return null;
+}
+
+function Sentinel2Preview({ record, indexName, refreshVersion }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <figure>
+      {failed ? (
+        <div className="sentinel2-preview-error" role="status">Preview unavailable. Check the API and try refreshing the records.</div>
+      ) : (
+        <img
+          src={`${sentinel2PreviewUrl(record.river_id, record.item_id, indexName, { overview: true })}${refreshVersion ? `&refresh=${refreshVersion}` : ""}`}
+          alt={`${indexName.toUpperCase()} spatial index preview for ${record.item_id}`}
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      )}
+      <figcaption>
+        {indexName.toUpperCase()} · valid-pixel mean overview ·{" "}
+        <a href={sentinel2PreviewUrl(record.river_id, record.item_id, indexName)} target="_blank" rel="noreferrer">Full-resolution PNG</a>
+      </figcaption>
+    </figure>
+  );
+}
+
+function Sentinel2IndexMap({ record, indexName, onIndexChange, opacity, onOpacityChange }) {
+  const bounds = record?.bounds_wgs84;
+  const colorScale = record?.preview_color_scale;
+  if (!record || record.status !== "processed" || !bounds) {
+    return (
+      <div className="sentinel2-map-unavailable" role="status">
+        Real raster map unavailable — this observation has no georeferenced processed output.
+      </div>
+    );
+  }
+  return (
+    <div className="sentinel2-map-panel">
+      <div className="sentinel2-map-controls">
+        <label>
+          Index
+          <select value={indexName} onChange={(event) => onIndexChange(event.target.value)}>
+            <option value="ndvi">NDVI</option>
+            <option value="evi">EVI</option>
+            <option value="ndmi">NDMI</option>
+          </select>
+        </label>
+        <label>
+          Opacity
+          <input
+            type="range"
+            min="0.1"
+            max="1"
+            step="0.05"
+            value={opacity}
+            onChange={(event) => onOpacityChange(Number(event.target.value))}
+          />
+          <span>{Math.round(opacity * 100)}%</span>
+        </label>
+      </div>
+      <MapContainer
+        center={[(bounds.south + bounds.north) / 2, (bounds.west + bounds.east) / 2]}
+        zoom={10}
+        scrollWheelZoom
+        className="sentinel2-leaflet-map"
+      >
+        <Sentinel2MapViewport bounds={bounds} />
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+        <ImageOverlay
+          alt={`${indexName.toUpperCase()} raster for ${record.item_id}`}
+          bounds={[[bounds.south, bounds.west], [bounds.north, bounds.east]]}
+          opacity={opacity}
+          url={sentinel2PreviewUrl(record.river_id, record.item_id, indexName)}
+        />
+      </MapContainer>
+      <div className="sentinel2-map-footer">
+        <span>{indexName.toUpperCase()} · -1</span>
+        <span
+          className="sentinel2-color-scale"
+          style={{ background: `linear-gradient(90deg, ${colorScale?.low || "#313695"}, ${colorScale?.middle || "#ffffbf"}, ${colorScale?.high || "#006837"})` }}
+        />
+        <span>+1 · transparent NoData</span>
+      </div>
+      <p className="panel-subtitle">Real {indexName.toUpperCase()} GeoTIFF rendered within its WGS84 bounds. The fixed scale clips values outside -1 to +1; the middle colour represents 0. Date: {new Date(record.acquisition_datetime).toLocaleString()} · Product: {record.item_id}</p>
+    </div>
+  );
+}
+
+function LandMonitoringSection({ title, eyebrow, description, catalog, status, error, riverSelection, domain, onReportContext }) {
+  const [sentinel2ByRiver, setSentinel2ByRiver] = useState({});
+  const [sentinel2Status, setSentinel2Status] = useState("loading");
+  const [sentinel2Error, setSentinel2Error] = useState("");
+  const [sentinel2Refresh, setSentinel2Refresh] = useState(0);
+  const [selectedIndex, setSelectedIndex] = useState("ndvi");
+  const [mapOpacity, setMapOpacity] = useState(0.85);
+  const [selectedRecordKey, setSelectedRecordKey] = useState("");
+  const { nisarProducts, sentinelObservations } = evidenceSources(catalog, riverSelection);
+  useEffect(() => {
+    const controller = new AbortController();
+    const riverIds = riverSelection === "both" ? ["kaveri", "tungabhadra"] : [riverSelection];
+    setSentinel2Status("loading");
+    setSentinel2Error("");
+    Promise.all(riverIds.map((riverId) => fetchSentinel2Observations(riverId, { signal: controller.signal })))
+      .then((responses) => {
+        setSentinel2ByRiver(Object.fromEntries(responses.map((response) => [response.river_id, response])));
+        setSentinel2Status("loaded");
+      })
+      .catch((fetchError) => {
+        if (fetchError.name !== "AbortError") {
+          setSentinel2Error(fetchError.message);
+          setSentinel2Status("error");
+        }
+      });
+    return () => controller.abort();
+  }, [riverSelection, sentinel2Refresh]);
+  const sentinel2Records = sentinel2Status === "loaded"
+    ? Object.values(sentinel2ByRiver).flatMap((response) => response.observations)
+    : [];
+  const processedRecords = sentinel2Records.filter((record) => record.status === "processed");
+  const selectedRecord = processedRecords.find((record) => `${record.river_id}-${record.item_id}` === selectedRecordKey)
+    || processedRecords[0]
+    || null;
+  useEffect(() => {
+    onReportContext({
+      domain, riverSelection, status: sentinel2Status,
+      riverId: selectedRecord?.river_id ?? null,
+      itemId: selectedRecord?.item_id ?? null,
+      indexName: selectedIndex,
+    });
+  }, [domain, riverSelection, sentinel2Status, selectedRecord, selectedIndex, onReportContext]);
+  const historicalComparisons = sentinel2Status === "loaded"
+    ? Object.values(sentinel2ByRiver).flatMap((response) => response.historical_comparisons || [])
+    : [];
+  const sourceSummary = sentinel2Status === "loading"
+    ? "Loading Sentinel-2 observations."
+    : sentinel2Status === "error"
+      ? "Sentinel-2 observations could not be loaded."
+      : processedRecords.length
+        ? "Processed Sentinel-2 observations are available for the selected river."
+        : status === "loading"
+          ? "Loading the other satellite acquisition catalog."
+          : status === "error"
+            ? "The other satellite acquisition catalog is unavailable."
+            : nisarProducts.length || sentinelObservations.length
+              ? "Satellite records are available for inspection, but no processed Sentinel-2 vegetation index is cached."
+              : "No compatible satellite observation is currently available for the selected river.";
   return (
     <section className="workspace-section" aria-label={title}>
       <div className="workspace-heading">
         <div>
           <div className="eyebrow"><span className="eyebrow-line" /> {eyebrow}</div>
-          <h1>{title}</h1>
+          <h2>{title}</h2>
           <p>{description}</p>
         </div>
-        <span className="evidence-disclosure">No {domain} index available</span>
+        <span className="evidence-disclosure">{sentinel2Status === "loading" ? "Loading Sentinel-2" : sentinel2Status === "error" ? "Sentinel-2 unavailable" : processedRecords.length ? "Processed Sentinel-2 indices" : `No ${domain} index available`}</span>
       </div>
       <div className="panel monitoring-status-panel">
         <div className="monitoring-status-icon"><Satellite size={18} /></div>
         <div>
-          <h2>Vegetation indicators are not available</h2>
-          <p>{sourceSummary} NDVI, EVI, crop classes, forest-loss measurements, health scores, and yield estimates are not generated by the current application.</p>
+          <h2>{sentinel2Status === "loading" ? "Loading Sentinel-2 observations" : sentinel2Status === "error" ? "Sentinel-2 observations unavailable" : processedRecords.length ? "Sentinel-2 vegetation indices are available" : "Vegetation indicators are not available"}</h2>
+          <p>{sourceSummary} {sentinel2Status === "loaded" && (processedRecords.length ? "NDVI, EVI and NDMI remain unvalidated except for the sample-scoped index assessments shown below; crop classes, forest-loss measurements, health scores, and yield estimates are not generated by the current application." : "NDVI, EVI, crop classes, forest-loss measurements, health scores, and yield estimates are not generated by the current application.")}</p>
         </div>
+        {domain === "forest" && (
+          <div className="monitoring-limitations">
+            <strong>Forest-specific evidence is not yet available</strong>
+            <span>These indices describe spectral vegetation and moisture signals, not forest cover or forest loss. Distinguishing natural forest from plantations and agricultural vegetation requires suitable independent land-cover references; forest classification and change validation are not implemented.</span>
+            <span>River-distance zones (0–100 m, 100–500 m and 500–1,000 m) and near-versus-outer comparisons are unavailable: the saved index rasters sample only the mapped centerline, and no suitable local tree-cover reference is integrated.</span>
+          </div>
+        )}
+      </div>
+      <div className="panel workspace-panel sentinel2-monitoring-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Sentinel-2 Level-2A vegetation indices</h2>
+            <p className="panel-subtitle">Microsoft Planetary Computer surface-reflectance observations, independently masked and processed at the recorded output resolution. Only valid pixels on the mapped centerline are shown; the surrounding rectangle is transparent. Zoom in on the map to inspect the narrow valid areas.</p>
+            <p className="panel-subtitle">Thumbnail cells show the mean of valid source pixels in each cell; their visible footprint is not the measured area. The map uses the full-resolution raster.</p>
+          </div>
+          <div className="sentinel2-panel-actions">
+            <span className="evidence-disclosure">{sentinel2Status === "loaded" ? `${sentinel2Records.length} record${sentinel2Records.length === 1 ? "" : "s"}` : sentinel2Status === "error" ? "Unavailable" : "Loading"}</span>
+            <button type="button" onClick={() => setSentinel2Refresh((value) => value + 1)}>Refresh saved records</button>
+          </div>
+        </div>
+        {sentinel2Error && <p className="inline-error">{sentinel2Error}</p>}
+        {!sentinel2Error && sentinel2Status === "loading" && <p role="status">Loading genuine Sentinel-2 observations…</p>}
+        {sentinel2Status === "loaded" && !sentinel2Records.length && (
+          <p>Real observation unavailable — no Sentinel-2 product with the required B02, B04, B08, B11 and SCL assets is cached for this river.</p>
+        )}
+        {processedRecords.length > 0 && (
+          <>
+            <label className="sentinel2-record-selector">
+              Map observation
+              <select
+                value={selectedRecord ? `${selectedRecord.river_id}-${selectedRecord.item_id}` : ""}
+                onChange={(event) => setSelectedRecordKey(event.target.value)}
+              >
+                {processedRecords.map((record) => (
+                  <option key={`${record.river_id}-${record.item_id}`} value={`${record.river_id}-${record.item_id}`}>
+                    {record.river_id} · {record.item_id} · {new Date(record.acquisition_datetime).toLocaleDateString()}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Sentinel2IndexMap
+              record={selectedRecord}
+              indexName={selectedIndex}
+              onIndexChange={setSelectedIndex}
+              opacity={mapOpacity}
+              onOpacityChange={setMapOpacity}
+            />
+          </>
+        )}
+        {historicalComparisons.length > 0 && (
+          <div className="sentinel2-history">
+            <h3>Compatible historical comparison</h3>
+            {historicalComparisons.map((comparison) => (
+              <div key={`${comparison.earlier_item_id}-${comparison.later_item_id}`} className="sentinel2-history-card">
+                <strong>{new Date(comparison.earlier_acquisition_datetime).toLocaleDateString()} → {new Date(comparison.later_acquisition_datetime).toLocaleDateString()}</strong>
+                <span>{comparison.interval_days.toFixed(1)} days · {comparison.common_valid_pixel_count} common valid pixels · {comparison.common_support_percent_of_earlier.toFixed(2)}% common support</span>
+                <div className="sentinel2-history-indices">
+                  {["ndvi", "evi", "ndmi"].map((indexName) => (
+                    <span key={indexName}>{indexName.toUpperCase()} Δ {comparison.indices[indexName].mean_difference.toFixed(4)}</span>
+                  ))}
+                </div>
+                <small>Unvalidated index difference only; not evidence of crop failure, deforestation, degradation, or confirmed environmental change.</small>
+              </div>
+            ))}
+          </div>
+        )}
+        {sentinel2Records.map((record) => (
+          <article className="sentinel2-observation" key={`${record.river_id}-${record.item_id}`}>
+            <div className="sentinel2-observation-header">
+              <div>
+                <h3>{record.river_id} · {record.item_id}</h3>
+                <p>{record.acquisition_datetime ? new Date(record.acquisition_datetime).toLocaleString() : "Acquisition date unavailable"} · {record.status}</p>
+              </div>
+              <span className="evidence-disclosure">Land-cover and change unvalidated</span>
+            </div>
+            {record.raster_reconciliation && (
+              <p className="monitoring-limitations" role="status">{record.raster_reconciliation.reason} Stored catalog: {record.raster_reconciliation.catalog_metadata.width} × {record.raster_reconciliation.catalog_metadata.height}, {record.raster_reconciliation.catalog_metadata.valid_pixel_count} NDVI valid pixels; current raster: {record.width} × {record.height}, {record.valid_pixel_count} NDVI valid pixels.</p>
+            )}
+            {record.status === "processed" ? (
+              <>
+                <div className="sentinel2-metric-grid">
+                  {["ndvi", "evi", "ndmi"].map((indexName) => {
+                    const stats = record.index_statistics?.[indexName];
+                    const assessment = record.vegetation_validation?.[`${domain}:${indexName}`];
+                    const protocol = assessment?.protocol;
+                    const metrics = assessment?.recorded_status ? null : assessment?.metrics;
+                    return (
+                      <div className="sentinel2-index-card" key={indexName}>
+                        <strong>{indexName.toUpperCase()}</strong>
+                        <span>{stats ? `mean ${stats.mean.toFixed(3)}` : "Unavailable"}</span>
+                        <small>{stats ? `${stats.minimum.toFixed(3)} to ${stats.maximum.toFixed(3)}` : "No valid pixels"}</small>
+                        <small>Index validation: {assessment?.status || "NOT_VALIDATED"}</small>
+                        <small>{assessment?.reason || "No independent reference assessment has been recorded."}</small>
+                        {protocol && (
+                          <>
+                            <small>Index reference: {protocol.reference_dataset} · {protocol.reference_provider} · {protocol.reference_acquisition_datetime} · native {protocol.reference_resolution_m} m</small>
+                            <small>Land-cover reference: {protocol.landcover_dataset} · {protocol.landcover_provider} · {protocol.landcover_acquisition_datetime} · native {protocol.landcover_resolution_m} m</small>
+                            <small>Sources: {protocol.reference_source} ({protocol.reference_license}) · {protocol.landcover_source} ({protocol.landcover_license})</small>
+                            <small>Declared review: {protocol.reviewer} · {protocol.review_date}</small>
+                            <small>Method: {protocol.methodology}</small>
+                            <small>Reference time offsets: index {(Math.abs(Date.parse(protocol.reference_acquisition_datetime) - Date.parse(record.acquisition_datetime)) / 86400000).toFixed(2)} days · land cover {(Math.abs(Date.parse(protocol.landcover_acquisition_datetime) - Date.parse(record.acquisition_datetime)) / 86400000).toFixed(2)} days</small>
+                          </>
+                        )}
+                        {metrics && (
+                          <>
+                            <small>Target common pixels: {metrics.common_target_pixels} · coverage of candidate valid pixels: {(metrics.target_coverage_fraction * 100).toFixed(2)}% · spatial blocks: {metrics.target_spatial_blocks}</small>
+                            <small>CRS: {metrics.crs} · bounds: {metrics.bounds.join(", ")}</small>
+                            {metrics.rmse != null && <small>RMSE {metrics.rmse.toFixed(4)} · MAE {metrics.mae.toFixed(4)} · bias {metrics.bias.toFixed(4)}</small>}
+                            <small>Reference class counts and index means: {Object.entries(metrics.classes).map(([name, value]) => `${name}: ${value.count}${value.candidate_mean == null ? "" : ` (mean ${value.candidate_mean.toFixed(3)})`}`).join(" · ")}</small>
+                          </>
+                        )}
+                        {assessment?.limitations?.map((limitation) => <small key={limitation}>{limitation}</small>)}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="sentinel2-preview-grid">
+                  {["ndvi", "evi", "ndmi"].map((indexName) => (
+                    <Sentinel2Preview key={`${indexName}-${sentinel2Refresh}`} record={record} indexName={indexName} refreshVersion={sentinel2Refresh} />
+                  ))}
+                </div>
+                <p className="panel-subtitle">
+                  {record.cloud_cover_percent == null ? "Cloud cover unavailable" : `${record.cloud_cover_percent.toFixed(1)}% cloud cover`} ·
+                  {" "}{record.valid_pixel_percent == null ? "Centerline coverage unavailable" : `${record.valid_pixel_percent.toFixed(2)}% valid centerline pixels`} ·
+                  {" "}{record.raster_pixel_percent == null ? "Raster coverage unavailable" : `${record.raster_pixel_percent.toFixed(3)}% of raster pixels valid`} · {record.crs || "CRS unavailable"} · {record.resolution_m == null ? "Resolution unavailable" : `${record.resolution_m} m`}
+                </p>
+              </>
+            ) : (
+              <p>Real observation unavailable — {record.error || "processing did not produce usable pixels"}.</p>
+            )}
+            <p className="monitoring-limitations">Indices are not crop-yield, crop-health, forest-loss, or deforestation measurements. Independent validation and compatible historical observations are required for interpretation.</p>
+          </article>
+        ))}
       </div>
       <div className="panel workspace-panel">
         <div className="panel-header">
@@ -584,7 +1029,10 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
             <p className="panel-subtitle">These records can support future domain-specific analysis after suitable optical data and validated methods are added.</p>
           </div>
         </div>
+        <h3 className="monitoring-source-heading">NISAR L2 UR GCOV</h3>
         <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
+        <h3 className="monitoring-source-heading">Sentinel-1 RTC</h3>
+        <SentinelObservationEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
       </div>
       <div className="monitoring-limitations">
         <strong>Current limitation</strong>
@@ -595,7 +1043,6 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
 }
 
 function ChangeMap({ region, layer, onSelectChange, rivers, riverSelection, riverLayers, selectedObservation, selectedFootprint, selectedAnalysisLayer, selectedOpticalLayer, selectedNetworkFeature }) {
-  const showChanges = layer === "Candidate change";
   const activeRivers = riverSelection === "both"
     ? rivers
     : rivers.filter((river) => river.id === riverSelection);
@@ -619,12 +1066,6 @@ function ChangeMap({ region, layer, onSelectChange, rivers, riverSelection, rive
       {selectedNetworkFeature && riverLayers.centerline && (
         <GeoJSON key={`nwic-${selectedNetworkFeature.source_object_id}`} data={selectedNetworkFeature.geometry} style={{ color: "#7043a3", weight: 4 }} />
       )}
-      <Polygon
-        positions={region.outline}
-        pathOptions={{ color: "#328f87", weight: 1.5, fillColor: "#6abbb0", fillOpacity: 0.11, dashArray: "6 5" }}
-      >
-        <Tooltip sticky>Illustrative area of interest · {region.extent}</Tooltip>
-      </Polygon>
       {selectedFootprint && (
         <GeoJSON
           data={{ type: "Feature", properties: {}, geometry: selectedFootprint }}
@@ -649,91 +1090,19 @@ function ChangeMap({ region, layer, onSelectChange, rivers, riverSelection, rive
         riverLayers.leftBank && renderRiverSegments(river, "left_bank_boundary", "#7b91a6", Boolean(river.left_bank_boundary), 2),
         riverLayers.rightBank && renderRiverSegments(river, "right_bank_boundary", "#9d7a58", Boolean(river.right_bank_boundary), 2),
       ])}
-      {showChanges && region.changes.map((change, index) => (
-        <Circle
-          center={change.center}
-          eventHandlers={{ click: () => onSelectChange(index) }}
-          key={`${region.extent}-${index}`}
-          pathOptions={{ color: "#ba6731", weight: 2, fillColor: "#edaa63", fillOpacity: 0.58 }}
-          radius={change.radius}
-        >
-          <Popup>
-            <strong>Illustrative candidate {String(index + 1).padStart(2, "0")}</strong><br />
-            Area estimate: {change.area}<br />
-            Status: synthetic demo only<br />
-            Evidence confidence: not validated
-          </Popup>
-        </Circle>
-      ))}
-      {!showChanges && region.changes.map((change, index) => (
-        <Circle
-          center={change.center}
-          key={`${region.extent}-${index}`}
-          pathOptions={{ color: "#5483a4", weight: 1, fillColor: "#80aecd", fillOpacity: 0.36 }}
-          radius={change.radius * 1.23}
-        >
-          <Tooltip sticky>Simulated radar footprint · not satellite data</Tooltip>
-        </Circle>
-      ))}
     </MapContainer>
-  );
-}
-
-function TrendChart({ region }) {
-  const values = useMemo(() => {
-    const seed = region.extent.length;
-    return [31, 35, 32, 42, 39, 48, 44, 54, 51, 63, 58, 68].map((value, index) => value + ((seed * (index + 2)) % 7) - 3);
-  }, [region]);
-
-  return (
-    <Plot
-      config={{ displayModeBar: false, responsive: true }}
-      data={[
-        {
-          x: ["Jun 02", "Jun 05", "Jun 08", "Jun 11", "Jun 14", "Jun 17", "Jun 20", "Jun 23", "Jun 26", "Jun 29", "Jul 02", "Jul 05"],
-          y: values,
-          type: "scatter",
-          mode: "lines",
-          line: { color: "#378f86", width: 2.5, shape: "spline" },
-          fill: "tozeroy",
-          fillcolor: "rgba(55,143,134,0.09)",
-          hovertemplate: "%{x}<br>Relative index: %{y}<extra>Simulated</extra>",
-        },
-      ]}
-      layout={{
-        autosize: true,
-        height: 205,
-        margin: { l: 36, r: 10, t: 8, b: 30 },
-        paper_bgcolor: "transparent",
-        plot_bgcolor: "transparent",
-        font: { family: "Inter, sans-serif", size: 10, color: "#86949b" },
-        xaxis: { fixedrange: true, showgrid: false, zeroline: false, linecolor: "#e9eeec", tickfont: { size: 9 } },
-        yaxis: { fixedrange: true, showgrid: true, gridcolor: "#edf1ef", zeroline: false, tickfont: { size: 9 }, title: { text: "Relative signal", font: { size: 9 } } },
-        showlegend: false,
-        hoverlabel: { bgcolor: "#173b43", font: { color: "#fff" } },
-      }}
-      useResizeHandler
-      style={{ width: "100%" }}
-    />
   );
 }
 
 function App() {
   const [activePage, setActivePage] = useState("Overview");
-  const [selectedRegionId, setSelectedRegionId] = useState(DEFAULT_REGION_ID);
-  const [catalog, setCatalog] = useState([]);
-  const [catalogStatus, setCatalogStatus] = useState("loading");
-  const [catalogError, setCatalogError] = useState("");
-  const [catalogRetry, setCatalogRetry] = useState(0);
-  const [observations, setObservations] = useState([]);
-  const [observationStatus, setObservationStatus] = useState("loading");
-  const [observationError, setObservationError] = useState("");
   const [rivers, setRivers] = useState([]);
   const [riverStatus, setRiverStatus] = useState("loading");
   const [riverError, setRiverError] = useState("");
   const [nisarCatalog, setNisarCatalog] = useState(null);
   const [nisarStatus, setNisarStatus] = useState("loading");
   const [nisarError, setNisarError] = useState("");
+  const [nisarRetry, setNisarRetry] = useState(0);
   const [riverSearch, setRiverSearch] = useState("");
   const [selectedNetworkFeature, setSelectedNetworkFeature] = useState(null);
   const cancelNetworkSelection = useRef(null);
@@ -746,12 +1115,13 @@ function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [selectedChange, setSelectedChange] = useState(null);
   const [notice, setNotice] = useState("");
-  const catalogRegion = catalog.find((item) => item.id === selectedRegionId);
-  const regionName = catalogRegion?.name ?? DEFAULT_REGION_NAME;
-  const region = regions[regionName];
-  const mapRegion = catalogRegion
-    ? { ...region, center: [catalogRegion.center_latitude, catalogRegion.center_longitude] }
-    : region;
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const exportLock = useRef(false);
+  const [landReportContext, setLandReportContext] = useState(null);
+  const catalogRegion = null;
+  const region = buildRealMapRegion(rivers, riverSelection);
+  const mapRegion = region;
   const selectedRiver = riverSelection === "both" ? null : rivers.find((item) => item.id === riverSelection) ?? null;
   const normalizedRiverSearch = riverSearch.trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
   const matchingRivers = rivers.filter((river) => (
@@ -772,36 +1142,9 @@ function App() {
   const selectedFootprint = selectedObservation?.footprint?.coordinates
     ? selectedObservation.footprint
     : null;
-  const isEvidencePage = ["Impact explorer", "Data & methodology", "About the project", "Agriculture", "Forest monitoring"].includes(activePage);
+  const isEvidencePage = ["Overview", "Map explorer", "Change analysis", "Impact explorer", "Data & methodology", "About the project", "Agriculture", "Forest monitoring", "AI analysis"].includes(activePage);
   const isChangeAnalysisPage = activePage === "Change analysis";
   const isFunctionalPage = isEvidencePage || isChangeAnalysisPage;
-
-  useEffect(() => {
-    const controller = new AbortController();
-    fetchCatalog(controller.signal)
-      .then(({ regions: apiRegions }) => {
-        if (!apiRegions.length) {
-          throw new Error("The API region catalog is empty; no dashboard region is available.");
-        }
-        const unsupportedRegion = apiRegions.find((item) => !regions[item.name]);
-        if (unsupportedRegion) {
-          throw new Error(`The API region "${unsupportedRegion.name}" has no configured demonstration map.`);
-        }
-        setCatalog(apiRegions);
-        setSelectedRegionId((current) => (
-          apiRegions.find((item) => item.id === current)?.id ?? apiRegions[0].id
-        ));
-        setCatalogError("");
-        setCatalogStatus("connected");
-      })
-      .catch((error) => {
-        if (error.name !== "AbortError") {
-          setCatalogError(error.message);
-          setCatalogStatus("error");
-        }
-      });
-    return () => controller.abort();
-  }, [catalogRetry]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -837,44 +1180,17 @@ function App() {
         }
       });
     return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
-    if (catalogStatus !== "connected" || !selectedRegionId) {
-      return undefined;
-    }
-    const controller = new AbortController();
-    setObservationStatus("loading");
-    setObservationError("");
-    setObservations([]);
-    fetchObservations(selectedRegionId, controller.signal)
-      .then((items) => {
-        setObservations(items);
-        setObservationStatus("loaded");
-      })
-      .catch((error) => {
-        if (error.name !== "AbortError") {
-          setObservations([]);
-          setObservationError(error.message);
-          setObservationStatus("error");
-        }
-      });
-    return () => controller.abort();
-  }, [catalogStatus, selectedRegionId]);
+  }, [nisarRetry]);
 
   const selectPage = (page) => {
     setActivePage(page);
+    setExportError("");
     if (page === "AI analysis") {
       setNotice("");
       document.getElementById("ai-analysis")?.scrollIntoView({ behavior: "smooth", block: "start" });
     } else {
       setNotice("");
     }
-  };
-
-  const selectRegion = (event) => {
-    setSelectedRegionId(event.target.value);
-    setSelectedChange(null);
   };
 
   const selectRiverId = (nextRiverSelection) => {
@@ -891,6 +1207,53 @@ function App() {
   };
 
   const selectRiver = (event) => selectRiverId(event.target.value);
+
+  const selectNetworkFeature = (feature) => {
+    setSelectedNetworkFeature(feature);
+    if (feature) {
+      setSelectedObservation(null);
+      setSelectedAnalysisLayer(null);
+      setSelectedOpticalLayer(null);
+      if (feature.geometry.pilot_match) {
+        setRiverSearch("");
+        setRiverSelection(feature.geometry.pilot_match.river_id);
+      }
+    }
+  };
+
+  const exportReport = async () => {
+    if (exportLock.current) return;
+    exportLock.current = true;
+    setExporting(true);
+    setExportError("");
+    setNotice("");
+    const isLand = activePage === "Agriculture" || activePage === "Forest monitoring";
+    const selectedNisar = selectedAnalysisLayer?.analysisId?.startsWith("nisar-")
+      ? selectedAnalysisLayer.analysisId.slice(6) : null;
+    const context = {
+      workspace: activePage,
+      river_id: riverSelection,
+      selected_product_id: isLand ? null : selectedOpticalLayer?.productId ?? selectedNisar ?? selectedObservation?.id ?? null,
+      selected_analysis_id: isLand ? null : selectedAnalysisLayer?.analysisId ?? null,
+      selected_optical_item_id: isLand ? null : selectedOpticalLayer?.itemId ?? null,
+      selected_network_id: isLand ? null : selectedNetworkFeature?.source_object_id ?? null,
+      map_layer: isLand ? "centerline" : selectedOpticalLayer ? "Sentinel-2 NDWI candidate"
+        : selectedAnalysisLayer ? "candidate mask"
+          : selectedFootprint ? "satellite footprint" : "centerline",
+      vegetation_river_id: isLand ? landReportContext?.riverId ?? null : null,
+      vegetation_item_id: isLand ? landReportContext?.itemId ?? null : null,
+      index_name: isLand ? landReportContext?.indexName ?? null : null,
+    };
+    try {
+      const filename = await downloadWorkspaceReport(context);
+      setNotice(`Report downloaded: ${filename}. Interpretation uses deterministic rules, not an AI model.`);
+    } catch (error) {
+      setExportError(error.message);
+    } finally {
+      exportLock.current = false;
+      setExporting(false);
+    }
+  };
 
   const selectSatelliteObservation = (observation) => {
     if (observation) {
@@ -937,22 +1300,20 @@ function App() {
   };
 
   const toggleRiverLayer = (layerName) => {
-    setRiverLayers((current) => ({
-      ...current,
-      [layerName]: !current[layerName],
-    }));
+    setRiverLayers((current) => {
+      const next = {
+        ...current,
+        [layerName]: !current[layerName],
+      };
+      if (layerName === "leftBank" && next.leftBank) {
+        next.rightBank = false;
+      }
+      if (layerName === "rightBank" && next.rightBank) {
+        next.leftBank = false;
+      }
+      return next;
+    });
   };
-
-  const scenarioWindow = observations.length
-    ? (() => {
-      const dates = observations.map((item) => item.scenario_date).sort();
-      return `${new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", timeZone: "UTC" }).format(new Date(dates[0]))} — ${new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" }).format(new Date(dates[dates.length - 1]))}`;
-    })()
-    : observationStatus === "loading" && catalogStatus === "connected"
-      ? "Loading scenario dates…"
-      : catalogStatus === "error" || observationStatus === "error"
-        ? "API catalog unavailable"
-        : "No scenario dates available";
 
   return (
     <div className="app-shell">
@@ -965,7 +1326,7 @@ function App() {
             <div className="breadcrumb">Workspace <span>/</span> <strong>{activePage}</strong></div>
           </div>
           <div className="topbar-right">
-            <div className={`status-pill ${catalogStatus === "connected" ? "status-pill-connected" : catalogStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> API {catalogStatus === "connected" ? "CONNECTED · OVERVIEW DEMO" : catalogStatus === "error" ? "UNAVAILABLE" : "CONNECTING"}</div>
+            <div className={`status-pill ${nisarStatus === "loaded" ? "status-pill-connected" : nisarStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> Satellite API {nisarStatus === "loaded" ? "CONNECTED · REAL DATA" : nisarStatus === "error" ? "UNAVAILABLE" : "CONNECTING"}</div>
             <button className="profile-button" title="Project workspace" type="button">SI</button>
           </div>
         </header>
@@ -973,36 +1334,28 @@ function App() {
         <div className="page-content">
           <div className="demo-banner" role="status">
             <div className="demo-banner-icon"><Radio size={16} /></div>
-            <div><strong>{catalogStatus === "connected" ? "Overview layers are illustrative" : "Demonstration mode"}</strong><span>Overview metrics, charts, and map scenarios are illustrative. The evidence pages show locally recovered satellite products and processing results separately.</span></div>
-            <span className="demo-banner-tag">SIMULATED</span>
+            <div><strong>Real data only</strong><span>Overview values come from persisted satellite acquisition records, processing outputs, and registered river geometry. When a real observation is unavailable, no substitute measurement is shown.</span></div>
+            <span className="demo-banner-tag">REAL DATA</span>
           </div>
 
-          {(catalogStatus === "error" || observationStatus === "error") && (
+          {nisarStatus === "error" && (
             <div className="api-error-banner" role="alert">
               <CircleHelp size={16} />
-            <div><strong>{catalogStatus === "error" ? "Backend catalog unavailable" : "Observation catalog unavailable"}</strong><span>{catalogStatus === "error" ? catalogError : observationError} The map remains a frontend-only synthetic preview; its scenarios are not loaded from the API.</span></div>
-            {catalogStatus === "error" && <button onClick={() => { setCatalogStatus("loading"); setCatalogError(""); setCatalogRetry((retry) => retry + 1); }} type="button">Retry connection</button>}
+            <div><strong>Satellite acquisition catalog unavailable</strong><span>{nisarError} {NO_REAL_MEASUREMENT}</span></div>
+            <button onClick={() => { setNisarStatus("loading"); setNisarError(""); setNisarCatalog(null); setNisarRetry((retry) => retry + 1); }} type="button">Retry connection</button>
             </div>
           )}
 
           {notice && <div className="preview-notice"><CircleHelp size={16} />{notice}<button aria-label="Dismiss notice" onClick={() => setNotice("")} type="button"><X size={15} /></button></div>}
+          {exportError && <div className="api-error-banner" role="alert">Report export failed: {exportError}</div>}
 
           <section className="page-heading">
             <div>
               <div className="eyebrow"><span className="eyebrow-line" /> EARTH OBSERVATION · INDIA</div>
-              <h1>{activePage === "Overview" || activePage === "Map explorer" ? "Surface change overview" : activePage}</h1>
-              <p className="heading-subtitle">{isFunctionalPage ? "Real acquisition records and implemented processing information, with scientific limitations shown explicitly." : "A simulated preview of how SAR observations could help surface changes for review."}</p>
+              <h1>{activePage === "Overview" ? "Surface change overview" : activePage}</h1>
+              <p className="heading-subtitle">Real acquisition records and implemented processing information, with scientific limitations shown explicitly.</p>
             </div>
             <div className="heading-actions">
-              <label className="region-select-wrap">
-                <Compass size={15} />
-                <select aria-label="Select demonstration region" disabled={catalogStatus !== "connected"} onChange={selectRegion} value={selectedRegionId}>
-                  {catalogStatus === "loading" && <option value={DEFAULT_REGION_ID}>Loading regions…</option>}
-                  {catalogStatus === "error" && <option value={DEFAULT_REGION_ID}>API catalog unavailable</option>}
-                  {catalog.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-                </select>
-                <ChevronDown size={14} />
-              </label>
               <label className="river-select-wrap">
                 <FileSearch size={15} />
                 <input
@@ -1025,8 +1378,8 @@ function App() {
               {riverStatus === "loaded" && riverSearch.trim() && matchingRivers.length === 0 && (
                 <span role="status">No registered rivers match this search.</span>
               )}
-              <button className="export-button" onClick={() => setNotice("Create a candidate analysis below to access its mask, GeoJSON, and PDF report downloads.")} type="button">
-                <Download size={15} /> Export
+              <button className="export-button" onClick={exportReport} disabled={exporting || (["Agriculture", "Forest monitoring"].includes(activePage) && (landReportContext?.domain !== (activePage === "Agriculture" ? "agriculture" : "forest") || landReportContext?.riverSelection !== riverSelection || landReportContext?.status === "loading"))} type="button">
+                <Download size={15} /> {exporting ? "Generating report..." : "Export"}
               </button>
             </div>
           </section>
@@ -1034,19 +1387,75 @@ function App() {
           {isChangeAnalysisPage && <ChangeAnalysis catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
           {isEvidencePage ? (
             <>
+              {(activePage === "Overview" || activePage === "Map explorer") && (
+                <RealOverview
+                  catalog={nisarCatalog}
+                  status={nisarStatus}
+                  error={nisarError}
+                  riverSelection={riverSelection}
+                  rivers={rivers}
+                  riverLayers={riverLayers}
+                  riverStatus={riverStatus}
+                  riverError={riverError}
+                  selectedObservation={selectedObservation}
+                  selectedFootprint={selectedFootprint}
+                  selectedAnalysisLayer={selectedAnalysisLayer}
+                  selectedOpticalLayer={selectedOpticalLayer}
+                  selectedNetworkFeature={selectedNetworkFeature}
+                  onToggleRiverLayer={toggleRiverLayer}
+                  onSelectAnalysisGeometry={selectAnalysisGeometry}
+                  onToggleOpticalLayer={toggleOpticalLayer}
+                  onSelectNetworkFeature={selectNetworkFeature}
+                  cancelNetworkSelection={cancelNetworkSelection}
+                  mapFocused={activePage === "Map explorer"}
+                />
+              )}
               {activePage === "Impact explorer" && <ImpactExplorer catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
-              {activePage === "Agriculture" && <LandMonitoringSection title="Agriculture monitoring" eyebrow="AGRICULTURE · SATELLITE EVIDENCE" description="Review available satellite observations around registered river corridors without inventing crop or vegetation measurements." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="agriculture" />}
-              {activePage === "Forest monitoring" && <LandMonitoringSection title="Forest monitoring" eyebrow="FORESTS · SATELLITE EVIDENCE" description="Review available satellite observations and understand which forest and vegetation analyses are not yet supported." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="forest" />}
+              {activePage === "Agriculture" && <LandMonitoringSection title="Agriculture monitoring" eyebrow="AGRICULTURE · SATELLITE EVIDENCE" description="Review available satellite observations around registered river corridors without inventing crop or vegetation measurements." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="agriculture" onReportContext={setLandReportContext} />}
+              {activePage === "Forest monitoring" && <LandMonitoringSection title="Forest monitoring" eyebrow="FORESTS · SATELLITE EVIDENCE" description="Review available satellite observations and understand which forest and vegetation analyses are not yet supported." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="forest" onReportContext={setLandReportContext} />}
               {activePage === "Data & methodology" && <MethodologySection />}
               {activePage === "About the project" && <AboutSection />}
+              {activePage === "Change analysis" && (
+                <section className="satellite-section" aria-label="Local satellite analysis">
+                  <AnalysisWorkspace onSelectAnalysisGeometry={selectAnalysisGeometry} riverSelection={riverSelection} selectedObservation={selectedObservation} />
+                </section>
+              )}
+              {activePage === "AI analysis" && (
+                <section className="satellite-section" aria-label="Data-grounded river analysis">
+                  <div className="ai-analysis-anchor" id="ai-analysis">
+                    <AIAnalysisPanel onSelectRiver={selectRiverId} riverSelection={riverSelection} selectedObservation={selectedObservation} />
+                  </div>
+                </section>
+              )}
+              {(activePage === "Overview" || activePage === "Map explorer") && (
+                <>
+                  <section className="satellite-section" aria-label="Data-grounded river analysis">
+                    <div className="ai-analysis-anchor" id="ai-analysis">
+                      <AIAnalysisPanel onSelectRiver={selectRiverId} riverSelection={riverSelection} selectedObservation={selectedObservation} />
+                    </div>
+                  </section>
+                  <section className="satellite-section" aria-label="Automatic satellite data acquisition">
+                    <AutomaticAcquisitionPanel onSelectAnalysisGeometry={selectAnalysisGeometry} onToggleOpticalLayer={toggleOpticalLayer} selectedOpticalLayer={selectedOpticalLayer} />
+                  </section>
+                  <section className="satellite-section" aria-label="Satellite observation discovery">
+                    <SatelliteSearchPanel riverSelection={riverSelection} onSelectObservation={selectSatelliteObservation} />
+                  </section>
+                  <section className="satellite-section" aria-label="Local satellite analysis">
+                    <AnalysisWorkspace onSelectAnalysisGeometry={selectAnalysisGeometry} riverSelection={riverSelection} selectedObservation={selectedObservation} />
+                  </section>
+                  <section className="satellite-section" aria-label="Independent reference validation">
+                    <ValidationWorkspace riverSelection={riverSelection} />
+                  </section>
+                </>
+              )}
             </>
-          ) : (
+          ) : (LEGACY_DEMONSTRATION_MODE && (
             <>
           <section aria-label="Demonstration summary metrics" className="metrics-grid">
             <MetricCard icon={Crosshair} label="Area in view" value={region.analyzed} note="illustrative coverage" tone="blue" />
             <MetricCard icon={Droplets} label="Candidate change" value={region.changed} note="not a damage estimate" trend="+2.4%" tone="amber" />
             <MetricCard icon={Layers3} label="Candidate regions" value={String(region.sites).padStart(2, "0")} note="simulated clusters" tone="teal" />
-            <MetricCard icon={ShieldAlert} label="Evidence status" value="Unvalidated" note="demo values only" tone="slate" />
+            <MetricCard icon={ShieldAlert} label="Evidence status" value="Illustrative" note="not satellite-derived" tone="slate" />
           </section>
 
           <section className="analysis-grid">
@@ -1072,8 +1481,8 @@ function App() {
                   </label>
                   <div className="river-layer-controls">
                     <button aria-pressed={riverLayers.centerline} className={riverLayers.centerline ? "river-layer-button active" : "river-layer-button"} onClick={() => toggleRiverLayer("centerline")} type="button">Centerline</button>
-                    <button aria-pressed={riverLayers.leftBank} className={riverLayers.leftBank ? "river-layer-button active" : "river-layer-button"} disabled onClick={() => toggleRiverLayer("leftBank")} title="Left-bank boundary data is not available yet" type="button">Left bank</button>
-                    <button aria-pressed={riverLayers.rightBank} className={riverLayers.rightBank ? "river-layer-button active" : "river-layer-button"} disabled onClick={() => toggleRiverLayer("rightBank")} title="Right-bank boundary data is not available yet" type="button">Right bank</button>
+                    <button aria-pressed={riverLayers.leftBank} className={riverLayers.leftBank ? "river-layer-button active" : "river-layer-button"} disabled={riverStatus !== "loaded"} onClick={() => toggleRiverLayer("leftBank")} title="Show the available left-bank boundary, or its explicit unavailable state" type="button">Left bank</button>
+                    <button aria-pressed={riverLayers.rightBank} className={riverLayers.rightBank ? "river-layer-button active" : "river-layer-button"} disabled={riverStatus !== "loaded"} onClick={() => toggleRiverLayer("rightBank")} title="Show the available right-bank boundary, or its explicit unavailable state" type="button">Right bank</button>
                   </div>
                 </div>
               </div>
@@ -1094,8 +1503,14 @@ function App() {
                   {riverLayers.leftBank && visibleRivers.some((river) => river.left_bank_boundary) && (
                     <div className="legend-item"><span className="legend-swatch outline-swatch" />Left bank</div>
                   )}
+                  {riverLayers.leftBank && !visibleRivers.some((river) => river.left_bank_boundary) && (
+                    <div className="legend-item legend-item-muted">Left bank boundary data unavailable</div>
+                  )}
                   {riverLayers.rightBank && visibleRivers.some((river) => river.right_bank_boundary) && (
                     <div className="legend-item"><span className="legend-swatch outline-swatch" />Right bank</div>
+                  )}
+                  {riverLayers.rightBank && !visibleRivers.some((river) => river.right_bank_boundary) && (
+                    <div className="legend-item legend-item-muted">Right bank boundary data unavailable</div>
                   )}
                   {selectedFootprint && selectedObservation && (
                     <>
@@ -1154,14 +1569,7 @@ function App() {
             </article>
           </section>
 
-          <RiverNetworkExplorer selected={selectedNetworkFeature} cancelSelectionRef={cancelNetworkSelection} onSelect={(feature) => {
-            setSelectedNetworkFeature(feature);
-            if (feature) {
-              setSelectedObservation(null);
-              setSelectedAnalysisLayer(null);
-              setSelectedOpticalLayer(null);
-            }
-          }} />
+          <RiverNetworkExplorer selected={selectedNetworkFeature} cancelSelectionRef={cancelNetworkSelection} onSelect={selectNetworkFeature} />
 
           <section className="satellite-section" aria-label="Data-grounded river analysis">
             <div className="ai-analysis-anchor" id="ai-analysis">
@@ -1260,10 +1668,10 @@ function App() {
             </article>
           </section>
             </>
-          )}
+          ))}
 
           <footer className="page-footer">
-            <span><span className="footer-status-dot" /> DEMO OVERLAYS · LIVE ACQUISITIONS SHOWN SEPARATELY</span>
+            <span><span className="footer-status-dot" /> REAL SATELLITE EVIDENCE · CANDIDATE OUTPUTS REMAIN UNVALIDATED</span>
             <span>Designed for NASA Space Apps Challenge 2026 <span className="footer-separator">·</span> “Dancing with the SARs”</span>
           </footer>
         </div>

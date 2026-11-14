@@ -63,7 +63,7 @@ export default function RiverNetworkExplorer({ onSelect, selected, cancelSelecti
   return (
     <section className="acquisition-source-note" aria-label="NWIC river network explorer">
       <h3>NWIC river network explorer</h3>
-      <p>Source: CWC / <a href="https://nwdp.nwic.gov.in/dataset/river-line" target="_blank" rel="noreferrer">National Water Data Portal River Network</a>. Registration and geometry do not establish satellite monitoring. Endpoint districts are not full district coverage. Monitoring controls remain tied to the pilot river selector, not this selection.</p>
+      <p>Source: CWC / <a href="https://nwdp.nwic.gov.in/dataset/river-line" target="_blank" rel="noreferrer">National Water Data Portal River Network</a>. Registration and geometry do not establish satellite monitoring. Endpoint districts are not full district coverage. Only verified pilot geometry matches update the monitoring selector.</p>
       {Object.entries({ q: "River name or source ID", basin: "Basin", sub_basin: "Sub-basin", state: "State", district: "Start or end district" }).map(([key, label]) => (
         <label key={key} style={{ display: "inline-flex", flexDirection: "column", margin: "4px" }}>
           {label}
@@ -78,7 +78,10 @@ export default function RiverNetworkExplorer({ onSelect, selected, cancelSelecti
       {geometryError && <p role="alert">{geometryError}</p>}
       {!loading && result && (
         <>
-          <p>{result.total} matching source features{result.total === 0 ? " · no imported records match" : ""}.</p>
+          <p>{result.source_status === "not_imported"
+            ? "NWIC source data has not been imported; network features and satellite linkage are unavailable."
+            : `${result.total} matching source features${result.total === 0 ? " · no imported records match" : ""}.`}</p>
+          {result.import_complete === false && <p>NWIC import is incomplete; search results cover only imported features.</p>}
           {result.features.map((feature) => (
             <button key={feature.source_object_id} type="button" disabled={loadingId === feature.source_object_id}
               onClick={() => selectFeature(feature)}>
@@ -92,7 +95,9 @@ export default function RiverNetworkExplorer({ onSelect, selected, cancelSelecti
           </div>
         </>
       )}
-      {selected && <p>Selected: {selected.name || "Unnamed feature"} · source ID {selected.source_object_id} · satellite status unknown; no observation linkage verified. <button type="button" onClick={() => { cancelSelectionRef.current?.(); onSelect(null); }}>Clear selected NWIC feature</button></p>}
+      {selected && <p>Selected: {selected.name || "Unnamed feature"} · source ID {selected.source_object_id} · {selected.geometry.pilot_match
+        ? `matched ${selected.geometry.pilot_match.river_id} pilot by source identity and geometry; satellite coverage is not established.`
+        : "satellite status unknown; no observation linkage verified."} <button type="button" onClick={() => { cancelSelectionRef.current?.(); onSelect(null); }}>Clear selected NWIC feature</button></p>}
     </section>
   );
 }

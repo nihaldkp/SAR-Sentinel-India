@@ -45,6 +45,11 @@ export default function AIAnalysisPanel({ onSelectRiver, riverSelection, selecte
       setRiverId(riverSelection);
       setProductId("");
       setAnalysis(null);
+    } else {
+      setRiverId("");
+      setProductId("");
+      setAnalysis(null);
+      setError("");
     }
   }, [riverSelection]);
 
