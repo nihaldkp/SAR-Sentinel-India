@@ -219,6 +219,37 @@ def test_verified_acquisitions_and_verification_api(
     assert verification.json()["sha256"] == configured_catalog["record"]["sha256"]
 
 
+def test_integration_recovers_local_record_when_legacy_catalog_checksum_is_missing(
+    configured_catalog: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_record = dict(configured_catalog["record"])
+    catalog_record = dict(local_record)
+    catalog_record["sha256"] = None
+    catalog_record["integrity_status"] = "not_verified"
+    monkeypatch.setattr(
+        acquisitions,
+        "_local_nisar_product_records",
+        lambda _river_id: [local_record],
+    )
+    monkeypatch.setattr(
+        acquisitions,
+        "_nisar_product_record",
+        lambda _river_id, _product_id: (catalog_record, configured_catalog["product_path"]),
+    )
+
+    records = integration._product_records("tungabhadra")
+
+    assert len(records) == 1
+    assert records[0][1]["sha256"] == local_record["sha256"]
+    verification = integration.get_acquisition_verification(
+        "tungabhadra",
+        PRODUCT_ID,
+    )
+    assert verification.sha256 == local_record["sha256"]
+    assert verification.integrity_status == "sha256_fingerprint_only"
+
+
 def test_missing_acquisition_and_product_identity_mismatch_are_rejected(
     configured_catalog: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

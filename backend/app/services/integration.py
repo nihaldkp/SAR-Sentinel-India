@@ -263,8 +263,11 @@ def _product_records(river_id: str | None = None) -> list[tuple[str, dict[str, A
                 continue
             if (
                 catalog_record.get("structure_verification_status") != "verified"
-                or catalog_record.get("sha256") != local_record.get("sha256")
                 or path.stat().st_size != local_record.get("size_bytes")
+                or (
+                    catalog_record.get("sha256")
+                    and catalog_record.get("sha256") != local_record.get("sha256")
+                )
             ):
                 continue
             verified.append((selected_river_id, local_record, path))

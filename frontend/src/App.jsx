@@ -39,7 +39,13 @@ import {
   Tooltip,
   useMap,
 } from "react-leaflet";
-import { API_BASE_URL, fetchCatalog, fetchObservations, fetchRivers } from "./services/api.js";
+import {
+  API_BASE_URL,
+  fetchAutomaticAcquisitions,
+  fetchCatalog,
+  fetchObservations,
+  fetchRivers,
+} from "./services/api.js";
 import SatelliteSearchPanel from "./components/SatelliteSearchPanel.jsx";
 import AnalysisWorkspace from "./components/AnalysisWorkspace.jsx";
 import AutomaticAcquisitionPanel from "./components/AutomaticAcquisitionPanel.jsx";
@@ -157,6 +163,8 @@ const navigation = [
   { label: "Map explorer", icon: Map },
   { label: "Change analysis", icon: Activity },
   { label: "Impact explorer", icon: Sprout },
+  { label: "Agriculture", icon: Sprout },
+  { label: "Forest monitoring", icon: Layers3 },
   { label: "AI analysis", icon: Radio },
 ];
 
@@ -349,6 +357,243 @@ function MetricCard({ icon: Icon, label, value, note, trend, tone }) {
   );
 }
 
+function formatEvidenceDate(value) {
+  if (!value) {
+    return "Date not available";
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "Date not available"
+    : new Intl.DateTimeFormat("en-GB", {
+      dateStyle: "medium",
+      timeZone: "UTC",
+    }).format(date);
+}
+
+function formatEvidenceNumber(value, maximumFractionDigits = 1) {
+  return Number.isFinite(value)
+    ? new Intl.NumberFormat("en-IN", { maximumFractionDigits }).format(value)
+    : "Not available";
+}
+
+function evidenceProducts(catalog, riverSelection) {
+  const rivers = catalog?.rivers ?? [];
+  return rivers
+    .filter((river) => riverSelection === "both" || river.river_id === riverSelection)
+    .flatMap((river) => (river.nisar_products ?? []).map((product) => ({
+      ...product,
+      river_id: river.river_id,
+    })))
+    .sort((left, right) => (
+      new Date(right.acquisition_start ?? 0).getTime()
+      - new Date(left.acquisition_start ?? 0).getTime()
+    ));
+}
+
+function EvidenceProductRow({ product }) {
+  const result = product.processing_result;
+  const status = result?.status ?? product.processing_status ?? product.download_status;
+  const isCandidate = status === "unvalidated_candidate";
+  const isNoData = status === "no_valid_corridor_data" || product.processing_status === "no_data";
+  return (
+    <article className="evidence-product">
+      <div className="evidence-product-heading">
+        <div>
+          <strong>{product.product_id}</strong>
+          <span>{product.river_id} · {formatEvidenceDate(product.acquisition_start)}</span>
+        </div>
+        <span className={`evidence-status ${isCandidate ? "evidence-status-candidate" : isNoData ? "evidence-status-empty" : ""}`}>
+          {isCandidate ? "Candidate only" : isNoData ? "No usable corridor data" : String(status ?? "Not processed").replaceAll("_", " ")}
+        </span>
+      </div>
+      {isCandidate && result ? (
+        <div className="evidence-facts">
+          <span>CRS <strong>{result.input_crs}</strong></span>
+          <span>Resolution <strong>{formatEvidenceNumber(result.pixel_size_m, 1)} m</strong></span>
+          <span>Valid pixels <strong>{formatEvidenceNumber(result.valid_pixel_count, 0)}</strong> ({formatEvidenceNumber((result.valid_data_fraction ?? 0) * 100, 1)}%)</span>
+          <span>Corridor coverage <strong>{formatEvidenceNumber(result.reference_centerline_coverage_percent, 1)}%</strong></span>
+          <span>Candidate area <strong>{formatEvidenceNumber(result.candidate_water_area_m2, 1)} m²</strong></span>
+        </div>
+      ) : isNoData && result ? (
+        <p className="evidence-note">
+          No candidate mask was generated because {formatEvidenceNumber(result.valid_pixel_count, 0)} valid paired HH/HV pixels were available in {formatEvidenceNumber(result.corridor_pixel_count, 0)} corridor pixels.
+        </p>
+      ) : (
+        <p className="evidence-note">The product is recorded locally but processing has not produced a usable result.</p>
+      )}
+    </article>
+  );
+}
+
+function AcquisitionEvidence({ catalog, status, error, riverSelection }) {
+  const products = evidenceProducts(catalog, riverSelection);
+  if (status === "loading") {
+    return <div className="workspace-empty" role="status">Loading locally recovered NISAR acquisitions…</div>;
+  }
+  if (status === "error") {
+    return <div className="workspace-empty workspace-empty-error" role="alert">{error}</div>;
+  }
+  if (!products.length) {
+    return <div className="workspace-empty">No locally recovered NISAR products are available for the selected river.</div>;
+  }
+  return (
+    <div className="evidence-list">
+      {products.map((product) => <EvidenceProductRow key={product.product_id} product={product} />)}
+    </div>
+  );
+}
+
+function ImpactExplorer({ catalog, status, error, riverSelection }) {
+  const products = evidenceProducts(catalog, riverSelection);
+  const candidates = products.filter((product) => product.processing_result?.status === "unvalidated_candidate");
+  const validPixels = candidates.reduce((sum, product) => sum + (product.processing_result?.valid_pixel_count ?? 0), 0);
+  const candidateArea = candidates.reduce((sum, product) => sum + (product.processing_result?.candidate_water_area_m2 ?? 0), 0);
+  const metricsReady = status === "loaded";
+  return (
+    <section className="workspace-section" aria-label="Impact explorer">
+      <div className="workspace-heading">
+        <div>
+          <div className="eyebrow"><span className="eyebrow-line" /> REAL ACQUISITION EVIDENCE</div>
+          <h1>Impact explorer</h1>
+          <p>Locally recovered NISAR GCOV observations and their exploratory corridor-level processing outputs.</p>
+        </div>
+        <span className="evidence-disclosure">Candidate classifications · not validated impact</span>
+      </div>
+      <div className="workspace-metrics">
+        <MetricCard icon={Satellite} label="Recovered products" value={metricsReady ? String(products.length) : "Not available"} note="NISAR GCOV records" tone="blue" />
+        <MetricCard icon={Crosshair} label="Valid pixels" value={metricsReady ? formatEvidenceNumber(validPixels, 0) : "Not available"} note="candidate outputs only" tone="teal" />
+        <MetricCard icon={Droplets} label="Candidate area" value={metricsReady ? `${formatEvidenceNumber(candidateArea, 1)} m²` : "Not available"} note="not flood extent" tone="amber" />
+      </div>
+      <div className="panel workspace-panel">
+        <div className="panel-header">
+          <div><h2>Acquisition evidence</h2><p className="panel-subtitle">A_009 and A_010 remain separate observations with separate processing outcomes.</p></div>
+        </div>
+        <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
+      </div>
+    </section>
+  );
+}
+
+function ChangeAnalysis({ catalog, status, error, riverSelection }) {
+  const products = evidenceProducts(catalog, riverSelection);
+  const candidates = products.filter((product) => product.processing_result?.status === "unvalidated_candidate");
+  const compatibleCandidates = candidates.length > 1 && new Set(
+    candidates.map((product) => `${product.processing_result.input_crs}:${product.processing_result.pixel_size_m}`),
+  ).size === 1;
+  return (
+    <section className="workspace-section" aria-label="Change analysis">
+      <div className="workspace-heading">
+        <div>
+          <div className="eyebrow"><span className="eyebrow-line" /> TEMPORAL EVIDENCE</div>
+          <h1>Change analysis</h1>
+          <p>Available acquisition dates and processing states are shown without inventing a change percentage.</p>
+        </div>
+        <span className="evidence-disclosure">No unvalidated change claim</span>
+      </div>
+      <div className="panel workspace-panel">
+        <div className="panel-header">
+          <div><h2>Observation timeline</h2><p className="panel-subtitle">Comparisons require compatible candidate masks and a documented comparison operation.</p></div>
+        </div>
+        <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
+        {status === "loaded" && (
+          <div className="comparison-callout">
+            {compatibleCandidates
+              ? "Compatible candidate masks are available, but this dashboard does not calculate a change percentage."
+              : "A comparable pair is not available: the recovered observations include one candidate result and/or a no-data result, so no change percentage is calculated."}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function MethodologySection() {
+  const steps = [
+    ["Discovery and recovery", "NISAR L2 GCOV products are discovered through ASF metadata and locally recovered products are structurally checked as NISAR GCOV HDF5 files."],
+    ["HH/HV processing", "Frequency-A HHHH and HVHV gamma0 linear-power datasets are read with the product validity mask and mapped river corridor."],
+    ["Candidate thresholding", "Power is converted with 10*log10(max(power, 1e-6)); independent 900-bin Otsu thresholds classify pixels where both HH and HV are below threshold."],
+    ["Outputs and metadata", "The pipeline writes a NoData-preserving candidate mask GeoTIFF, two-band measurement GeoTIFF, display-only GeoJSON, and processing metadata."],
+  ];
+  return (
+    <section className="workspace-section" aria-label="Data and methodology">
+      <div className="workspace-heading">
+        <div><div className="eyebrow"><span className="eyebrow-line" /> REPRODUCIBLE PIPELINE</div><h1>Data & methodology</h1><p>Implemented processing steps and the boundaries of what the outputs mean.</p></div>
+      </div>
+      <div className="methodology-grid">
+        {steps.map(([title, description], index) => (
+          <article className="panel methodology-card" key={title}><span className="methodology-index">0{index + 1}</span><h2>{title}</h2><p>{description}</p></article>
+        ))}
+      </div>
+      <div className="panel limitations-panel">
+        <h2>Interpretation limits</h2>
+        <p>Candidate pixels can also represent radar-dark surfaces, shadow, or other non-water targets. The corridor buffer and threshold sensitivity are exploratory diagnostics; no ground-truth accuracy assessment, flood validation, riverbank measurement, or scientific validation is performed.</p>
+      </div>
+    </section>
+  );
+}
+
+function AboutSection() {
+  return (
+    <section className="workspace-section" aria-label="About the project">
+      <div className="workspace-heading">
+        <div><div className="eyebrow"><span className="eyebrow-line" /> NASA SPACE APPS CHALLENGE 2026</div><h1>About the project</h1><p>Understanding Indian rivers through openly documented satellite observation workflows.</p></div>
+      </div>
+      <div className="about-grid">
+        <article className="panel about-card"><h2>Purpose</h2><p>SAR Sentinel India helps teams inspect river and water-body observations, connect them to mapped river corridors, and hand reproducible candidate outputs to GIS analysts.</p></article>
+        <article className="panel about-card"><h2>Supported observations</h2><p>The application supports NISAR GCOV acquisition and candidate processing, Sentinel-1 RTC acquisition and candidate analysis, and OpenStreetMap river centerline context where records are available.</p></article>
+        <article className="panel about-card"><h2>Current capability</h2><p>Real product records, processing metadata, masks, measurements, and display polygons can be inspected separately from the dashboard's illustrative overview layers.</p></article>
+        <article className="panel about-card"><h2>Responsible interpretation</h2><p>Outputs labeled candidate or unvalidated are not verified inundation, damage, river boundaries, erosion, deposition, or environmental measurements. Independent GIS and scientific review remains necessary.</p></article>
+      </div>
+    </section>
+  );
+}
+
+function LandMonitoringSection({ title, eyebrow, description, catalog, status, error, riverSelection, domain }) {
+  const products = evidenceProducts(catalog, riverSelection);
+  const hasSentinelObservations = (catalog?.rivers ?? [])
+    .filter((river) => riverSelection === "both" || river.river_id === riverSelection)
+    .some((river) => (river.observations ?? []).length > 0);
+  const sourceSummary = status === "loading"
+    ? "Loading the acquisition catalog."
+    : status === "error"
+      ? "The acquisition catalog could not be loaded."
+      : products.length || hasSentinelObservations
+    ? "Satellite records are available for inspection, but this catalog does not contain a vegetation-index product."
+    : "No compatible satellite observation is currently available for the selected river.";
+  return (
+    <section className="workspace-section" aria-label={title}>
+      <div className="workspace-heading">
+        <div>
+          <div className="eyebrow"><span className="eyebrow-line" /> {eyebrow}</div>
+          <h1>{title}</h1>
+          <p>{description}</p>
+        </div>
+        <span className="evidence-disclosure">No {domain} index available</span>
+      </div>
+      <div className="panel monitoring-status-panel">
+        <div className="monitoring-status-icon"><Satellite size={18} /></div>
+        <div>
+          <h2>Vegetation indicators are not available</h2>
+          <p>{sourceSummary} NDVI, EVI, crop classes, forest-loss measurements, health scores, and yield estimates are not generated by the current application.</p>
+        </div>
+      </div>
+      <div className="panel workspace-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Available satellite observations</h2>
+            <p className="panel-subtitle">These records can support future domain-specific analysis after suitable optical data and validated methods are added.</p>
+          </div>
+        </div>
+        <AcquisitionEvidence catalog={catalog} status={status} error={error} riverSelection={riverSelection} />
+      </div>
+      <div className="monitoring-limitations">
+        <strong>Current limitation</strong>
+        <span>Available NISAR GCOV and Sentinel-1 records are SAR observations for exploratory water and surface-change workflows. They do not establish crop type, crop condition, forest cover, deforestation, or agricultural statistics. Acquisition dates, source metadata, and coverage must be reviewed before any future vegetation comparison.</span>
+      </div>
+    </section>
+  );
+}
+
 function ChangeMap({ region, layer, onSelectChange, rivers, riverSelection, riverLayers, selectedObservation, selectedFootprint, selectedAnalysisLayer, selectedOpticalLayer, selectedNetworkFeature }) {
   const showChanges = layer === "Candidate change";
   const activeRivers = riverSelection === "both"
@@ -486,6 +731,9 @@ function App() {
   const [rivers, setRivers] = useState([]);
   const [riverStatus, setRiverStatus] = useState("loading");
   const [riverError, setRiverError] = useState("");
+  const [nisarCatalog, setNisarCatalog] = useState(null);
+  const [nisarStatus, setNisarStatus] = useState("loading");
+  const [nisarError, setNisarError] = useState("");
   const [riverSearch, setRiverSearch] = useState("");
   const [selectedNetworkFeature, setSelectedNetworkFeature] = useState(null);
   const cancelNetworkSelection = useRef(null);
@@ -524,6 +772,9 @@ function App() {
   const selectedFootprint = selectedObservation?.footprint?.coordinates
     ? selectedObservation.footprint
     : null;
+  const isEvidencePage = ["Impact explorer", "Data & methodology", "About the project", "Agriculture", "Forest monitoring"].includes(activePage);
+  const isChangeAnalysisPage = activePage === "Change analysis";
+  const isFunctionalPage = isEvidencePage || isChangeAnalysisPage;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -571,6 +822,24 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    setNisarStatus("loading");
+    fetchAutomaticAcquisitions(controller.signal)
+      .then((response) => {
+        setNisarCatalog(response);
+        setNisarError("");
+        setNisarStatus("loaded");
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError") {
+          setNisarError(error.message);
+          setNisarStatus("error");
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
     if (catalogStatus !== "connected" || !selectedRegionId) {
       return undefined;
     }
@@ -598,8 +867,6 @@ function App() {
     if (page === "AI analysis") {
       setNotice("");
       document.getElementById("ai-analysis")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else if (page !== "Overview" && page !== "Map explorer") {
-      setNotice(`${page} is a preview section. Live analysis will be added in a later milestone.`);
     } else {
       setNotice("");
     }
@@ -698,7 +965,7 @@ function App() {
             <div className="breadcrumb">Workspace <span>/</span> <strong>{activePage}</strong></div>
           </div>
           <div className="topbar-right">
-            <div className={`status-pill ${catalogStatus === "connected" ? "status-pill-connected" : catalogStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> API {catalogStatus === "connected" ? "CONNECTED · DEMO" : catalogStatus === "error" ? "UNAVAILABLE" : "CONNECTING"}</div>
+            <div className={`status-pill ${catalogStatus === "connected" ? "status-pill-connected" : catalogStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> API {catalogStatus === "connected" ? "CONNECTED · OVERVIEW DEMO" : catalogStatus === "error" ? "UNAVAILABLE" : "CONNECTING"}</div>
             <button className="profile-button" title="Project workspace" type="button">SI</button>
           </div>
         </header>
@@ -706,7 +973,7 @@ function App() {
         <div className="page-content">
           <div className="demo-banner" role="status">
             <div className="demo-banner-icon"><Radio size={16} /></div>
-            <div><strong>{catalogStatus === "connected" ? "API catalog connected · overview metrics are demonstrations" : "Demonstration mode"}</strong><span>Overview metrics, charts, and scenarios are illustrative; real satellite acquisitions and processing results are shown separately below when available.</span></div>
+            <div><strong>{catalogStatus === "connected" ? "Overview layers are illustrative" : "Demonstration mode"}</strong><span>Overview metrics, charts, and map scenarios are illustrative. The evidence pages show locally recovered satellite products and processing results separately.</span></div>
             <span className="demo-banner-tag">SIMULATED</span>
           </div>
 
@@ -724,7 +991,7 @@ function App() {
             <div>
               <div className="eyebrow"><span className="eyebrow-line" /> EARTH OBSERVATION · INDIA</div>
               <h1>{activePage === "Overview" || activePage === "Map explorer" ? "Surface change overview" : activePage}</h1>
-              <p className="heading-subtitle">A simulated preview of how SAR observations could help surface changes for review.</p>
+              <p className="heading-subtitle">{isFunctionalPage ? "Real acquisition records and implemented processing information, with scientific limitations shown explicitly." : "A simulated preview of how SAR observations could help surface changes for review."}</p>
             </div>
             <div className="heading-actions">
               <label className="region-select-wrap">
@@ -764,6 +1031,17 @@ function App() {
             </div>
           </section>
 
+          {isChangeAnalysisPage && <ChangeAnalysis catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
+          {isEvidencePage ? (
+            <>
+              {activePage === "Impact explorer" && <ImpactExplorer catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
+              {activePage === "Agriculture" && <LandMonitoringSection title="Agriculture monitoring" eyebrow="AGRICULTURE · SATELLITE EVIDENCE" description="Review available satellite observations around registered river corridors without inventing crop or vegetation measurements." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="agriculture" />}
+              {activePage === "Forest monitoring" && <LandMonitoringSection title="Forest monitoring" eyebrow="FORESTS · SATELLITE EVIDENCE" description="Review available satellite observations and understand which forest and vegetation analyses are not yet supported." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="forest" />}
+              {activePage === "Data & methodology" && <MethodologySection />}
+              {activePage === "About the project" && <AboutSection />}
+            </>
+          ) : (
+            <>
           <section aria-label="Demonstration summary metrics" className="metrics-grid">
             <MetricCard icon={Crosshair} label="Area in view" value={region.analyzed} note="illustrative coverage" tone="blue" />
             <MetricCard icon={Droplets} label="Candidate change" value={region.changed} note="not a damage estimate" trend="+2.4%" tone="amber" />
@@ -981,6 +1259,8 @@ function App() {
               </span></div>
             </article>
           </section>
+            </>
+          )}
 
           <footer className="page-footer">
             <span><span className="footer-status-dot" /> DEMO OVERLAYS · LIVE ACQUISITIONS SHOWN SEPARATELY</span>

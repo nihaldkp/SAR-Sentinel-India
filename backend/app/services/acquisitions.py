@@ -57,6 +57,7 @@ CATALOG_PATH = REPOSITORY_ROOT / "data" / "satellite_catalog.sqlite3"
 
 _REFRESH_LOCK = threading.Lock()
 _NISAR_PROCESS_LOCK = threading.Lock()
+_LOCAL_NISAR_CHECKSUM_CACHE: dict[tuple[str, int, int], str] = {}
 _NISAR_COMPONENT_SENSITIVITY_LOCK = threading.Lock()
 _NISAR_DOWNLOAD_LOCK = threading.Lock()
 
@@ -1633,6 +1634,22 @@ def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
             ):
                 LOGGER.warning("Skipping cached NISAR product %s: provider checksum verification failed.", product_id)
                 continue
+        if not verification.get("sha256"):
+            cache_key = (
+                str(product_path),
+                product_path.stat().st_size,
+                product_path.stat().st_mtime_ns,
+            )
+            sha256 = _LOCAL_NISAR_CHECKSUM_CACHE.get(cache_key)
+            if sha256 is None:
+                sha256 = calculate_checksums(product_path)["sha256"]
+                _LOCAL_NISAR_CHECKSUM_CACHE[cache_key] = sha256
+            verification = {
+                **verification,
+                "sha256": sha256,
+                "integrity_status": "sha256_fingerprint_only",
+                "provider_authenticity_status": "not_verified",
+            }
 
         date_match = re.search(r"_(\d{8}T\d{6})_(\d{8}T\d{6})_", product_id)
         acquisition_start = metadata.get("acquisition_start")
@@ -1719,6 +1736,7 @@ def _merge_nisar_product_records(
         previous = cached_by_id.get(product_id, {})
         current = dict(product)
         if previous.get("download_status") == "downloaded":
+            local_sha256 = current.get("sha256")
             for field in (
                 "availability",
                 "download_status",
@@ -1738,7 +1756,15 @@ def _merge_nisar_product_records(
                 "processing_result",
                 "message",
             ):
-                if field in previous:
+                if field in previous and previous[field] is not None:
+                    if field == "sha256" and local_sha256:
+                        continue
+                    if (
+                        field == "integrity_status"
+                        and local_sha256
+                        and previous[field] == "not_verified"
+                    ):
+                        continue
                     current[field] = previous[field]
             local_processing_result = product.get("processing_result") or {}
             cached_processing_result = dict(current.get("processing_result") or {})

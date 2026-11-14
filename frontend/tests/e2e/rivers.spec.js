@@ -1395,3 +1395,15 @@ test("NISAR connection summary displays recorded authenticated product access", 
   await expect(summary.getByText(/product access verified by one-byte request/)).toBeVisible();
   await expect(summary.getByText(/10 Nov 2026/).first()).toBeVisible();
 });
+
+test("agriculture and forest pages disclose unavailable vegetation indicators", async ({ page }) => {
+  await page.getByRole("button", { name: "Agriculture" }).click();
+  await expect(page.getByRole("heading", { name: "Agriculture monitoring" })).toBeVisible();
+  await expect(page.getByText("Vegetation indicators are not available")).toBeVisible();
+  await expect(page.getByText(/NDVI, EVI, crop classes/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Forest monitoring" }).click();
+  await expect(page.getByRole("region", { name: "Forest monitoring" }).getByRole("heading", { name: "Forest monitoring" })).toBeVisible();
+  await expect(page.getByText("No forest index available")).toBeVisible();
+  await expect(page.getByText(/deforestation, or agricultural statistics/)).toBeVisible();
+});
