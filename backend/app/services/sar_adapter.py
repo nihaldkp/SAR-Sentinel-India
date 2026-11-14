@@ -12,7 +12,10 @@ from app.schemas.integration import (
     OutputRegistrationRequest,
     ProcessingAdapterInput,
 )
-from app.services.nisar_gcov import PROCESSOR_VERSION, process_gcov_product
+from app.services.nisar_gcov import (
+    PROCESSOR_VERSION,
+    process_gcov_product,
+)
 
 
 class NisarGcovAdapter:
@@ -26,10 +29,12 @@ class NisarGcovAdapter:
 
         source_path = Path(request.local_file_path).resolve()
         if not source_path.is_file():
-            raise FileNotFoundError("The verified NISAR acquisition file is unavailable.")
+            raise FileNotFoundError(
+                "The verified NISAR acquisition file is unavailable."
+            )
 
-        # The integration service creates job_directory before calling this
-        # adapter. The processor requires a new, non-existent output directory.
+        # The integration service creates job_directory before calling
+        # this adapter. The processor requires a new output directory.
         result = process_gcov_product(
             hdf5_path=source_path,
             product_id=request.acquisition.product_id,
@@ -41,14 +46,16 @@ class NisarGcovAdapter:
 
         metadata_path = output_directory / "processing-metadata.json"
         if not metadata_path.is_file():
-            raise RuntimeError("The SAR processor did not create processing metadata.")
+            raise RuntimeError(
+                "The SAR processor did not create processing metadata."
+            )
 
         mask_path = output_directory / "candidate-water-mask.tif"
         if mask_path.is_file():
             outputs.append(
                 self._raster_asset(
                     request.job_id,
-                    output_directory,
+                    job_directory,
                     mask_path,
                     role="candidate_water_mask",
                     units="class_code",
@@ -60,7 +67,7 @@ class NisarGcovAdapter:
             outputs.append(
                 self._raster_asset(
                     request.job_id,
-                    output_directory,
+                    job_directory,
                     measurements_path,
                     role="gcov_measurements",
                     units="dimensionless_gamma0_linear_power",
@@ -72,7 +79,7 @@ class NisarGcovAdapter:
             outputs.append(
                 self._vector_asset(
                     request.job_id,
-                    output_directory,
+                    job_directory,
                     vector_path,
                 )
             )
@@ -81,7 +88,9 @@ class NisarGcovAdapter:
             OutputAssetRegistration(
                 role="processing_metadata",
                 storage_key=self._storage_key(
-                    request.job_id, job_directory, metadata_path
+                    request.job_id,
+                    job_directory,
+                    metadata_path,
                 ),
                 output_type="metadata",
                 media_type="application/json",
@@ -115,9 +124,13 @@ class NisarGcovAdapter:
 
     @staticmethod
     def _storage_key(
-        job_id: str, job_directory: Path, file_path: Path
+        job_id: str,
+        job_directory: Path,
+        file_path: Path,
     ) -> str:
-        relative_path = file_path.resolve().relative_to(job_directory.resolve())
+        relative_path = file_path.resolve().relative_to(
+            job_directory.resolve()
+        )
         return f"{job_id}/{relative_path.as_posix()}"
 
     @classmethod
@@ -132,7 +145,9 @@ class NisarGcovAdapter:
     ) -> OutputAssetRegistration:
         with rasterio.open(path) as dataset:
             if dataset.crs is None:
-                raise ValueError(f"Raster output has no CRS: {path.name}")
+                raise ValueError(
+                    f"Raster output has no CRS: {path.name}"
+                )
 
             metadata: dict[str, Any] = {
                 "crs": dataset.crs.to_string(),
@@ -147,7 +162,11 @@ class NisarGcovAdapter:
 
         return OutputAssetRegistration(
             role=role,
-            storage_key=cls._storage_key(job_id, job_directory, path),
+            storage_key=cls._storage_key(
+                job_id,
+                job_directory,
+                path,
+            ),
             output_type="raster",
             media_type="image/tiff",
             metadata=metadata,
@@ -160,7 +179,10 @@ class NisarGcovAdapter:
         job_directory: Path,
         path: Path,
     ) -> OutputAssetRegistration:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        document = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
         geometry_types = {
             feature.get("geometry", {}).get("type")
             for feature in document.get("features", [])
@@ -175,7 +197,11 @@ class NisarGcovAdapter:
 
         return OutputAssetRegistration(
             role="candidate_water_polygons",
-            storage_key=cls._storage_key(job_id, job_directory, path),
+            storage_key=cls._storage_key(
+                job_id,
+                job_directory,
+                path,
+            ),
             output_type="vector",
             media_type="application/geo+json",
             metadata={
