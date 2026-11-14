@@ -140,11 +140,37 @@ def _connection_schema() -> Generator[sqlite3.Connection, None, None]:
         connection.close()
 
 
+
 def _json_text(value: Any) -> str:
+    def normalize(item: Any) -> Any:
+        if isinstance(item, float):
+            if math.isnan(item):
+                return "NaN"
+            if math.isinf(item):
+                return "Infinity" if item > 0 else "-Infinity"
+            return item
+
+        if isinstance(item, dict):
+            return {key: normalize(child) for key, child in item.items()}
+
+        if isinstance(item, (list, tuple)):
+            return [normalize(child) for child in item]
+
+        return item
+
     try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return json.dumps(
+            normalize(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     except (TypeError, ValueError) as error:
-        raise ValueError("Integration request and result values must be finite JSON data.") from error
+        raise ValueError(
+            "Integration request and result values must be finite JSON data."
+        ) from error
+
 
 
 def _reject_secrets(value: Any) -> None:
@@ -662,6 +688,7 @@ def _validate_output_format(output: OutputAssetRegistration) -> None:
             raise ValueError("Raster and vector output metadata must declare their CRS.")
 
 
+
 def _validate_output_file(
     output: OutputAssetRegistration,
     path: Path,
@@ -674,23 +701,44 @@ def _validate_output_file(
         try:
             with rasterio.open(path) as dataset:
                 declared_crs = CRS.from_user_input(output.metadata["crs"])
-                declared_transform = tuple(float(value) for value in output.metadata["transform"])
-                actual_transform = tuple(float(value) for value in dataset.transform)[:6]
+                declared_transform = tuple(
+                    float(value) for value in output.metadata["transform"]
+                )
+                actual_transform = tuple(
+                    float(value) for value in dataset.transform
+                )[:6]
+
                 declared_nodata = output.metadata["nodata"]
                 actual_nodata = dataset.nodata
-                nodata_matches = (
-                    declared_nodata is None and actual_nodata is None
-                ) or (
+                if declared_nodata == "NaN":
+                    declared_nodata = float("nan")
+                elif declared_nodata == "Infinity":
+                    declared_nodata = float("inf")
+                elif declared_nodata == "-Infinity":
+                    declared_nodata = float("-inf")
+
+                if declared_nodata is None and actual_nodata is None:
+                    nodata_matches = True
+                elif (
                     isinstance(declared_nodata, (int, float))
                     and not isinstance(declared_nodata, bool)
                     and actual_nodata is not None
-                    and math.isclose(
-                        float(declared_nodata),
-                        float(actual_nodata),
+                ):
+                    declared_value = float(declared_nodata)
+                    actual_value = float(actual_nodata)
+
+                    nodata_matches = (
+                        math.isnan(declared_value)
+                        and math.isnan(actual_value)
+                    ) or math.isclose(
+                        declared_value,
+                        actual_value,
                         rel_tol=0,
                         abs_tol=0,
                     )
-                )
+                else:
+                    nodata_matches = False
+
                 if (
                     dataset.driver != "GTiff"
                     or dataset.count < 1
@@ -702,58 +750,121 @@ def _validate_output_file(
                     or not nodata_matches
                 ):
                     raise ValueError(
-                        "Raster file metadata does not match the declared CRS, dimensions, transform, or NoData."
+                        "Raster file metadata does not match the declared CRS, "
+                        "dimensions, transform, or NoData."
                     )
-        except (rasterio.errors.RasterioError, OSError, TypeError) as error:
-            raise ValueError("The registered raster is not a readable GeoTIFF.") from error
+
+        except (
+            rasterio.errors.RasterioError,
+            OSError,
+            TypeError,
+            KeyError,
+            ValueError,
+        ) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "Raster file metadata"
+            ):
+                raise
+            raise ValueError(
+                "The registered raster is not a readable GeoTIFF "
+                "or its metadata is invalid."
+            ) from error
+
     elif output.output_type == "vector" and path.suffix.casefold() == ".geojson":
         if size_bytes > 100 * 1024 * 1024:
             raise ValueError("GeoJSON outputs are limited to 100 MiB.")
+
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError("The registered GeoJSON output is not valid UTF-8 JSON.") from error
+            raise ValueError(
+                "The registered GeoJSON output is not valid UTF-8 JSON."
+            ) from error
+
         if not isinstance(payload, dict) or payload.get("type") not in {
             "Feature",
             "FeatureCollection",
         }:
-            raise ValueError("The GeoJSON output must be a Feature or FeatureCollection.")
+            raise ValueError(
+                "The GeoJSON output must be a Feature or FeatureCollection."
+            )
+
         if payload["type"] == "FeatureCollection":
             features = payload.get("features")
             if not isinstance(features, list) or any(
-                not isinstance(feature, dict) or feature.get("type") != "Feature"
+                not isinstance(feature, dict)
+                or feature.get("type") != "Feature"
                 for feature in features
             ):
-                raise ValueError("The GeoJSON FeatureCollection contains invalid features.")
+                raise ValueError(
+                    "The GeoJSON FeatureCollection contains invalid features."
+                )
+
         elif not isinstance(payload.get("geometry"), (dict, type(None))):
             raise ValueError("The GeoJSON Feature has an invalid geometry.")
-        if output.metadata["crs"].casefold() not in {"epsg:4326", "ogc:crs84"}:
-            raise ValueError("GeoJSON output CRS must be EPSG:4326 longitude/latitude.")
+
+        if output.metadata["crs"].casefold() not in {
+            "epsg:4326",
+            "ogc:crs84",
+        }:
+            raise ValueError(
+                "GeoJSON output CRS must be EPSG:4326 longitude/latitude."
+            )
+
     elif output.output_type == "vector":
         if size_bytes < 16:
-            raise ValueError("The registered GeoPackage output is too small to be valid.")
+            raise ValueError(
+                "The registered GeoPackage output is too small to be valid."
+            )
+
         try:
-            with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as connection:
-                application_id = connection.execute("PRAGMA application_id").fetchone()[0]
+            with sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+            ) as connection:
+                application_id = connection.execute(
+                    "PRAGMA application_id"
+                ).fetchone()[0]
+
                 has_feature_contents = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gpkg_contents'"
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='gpkg_contents'"
                 ).fetchone()
+
                 if application_id != 0x47504B47 or not has_feature_contents:
-                    raise ValueError("The registered GeoPackage is missing required GeoPackage metadata.")
+                    raise ValueError(
+                        "The registered GeoPackage is missing required "
+                        "GeoPackage metadata."
+                    )
+
                 content_row = connection.execute(
-                    "SELECT 1 FROM gpkg_contents WHERE data_type='features' LIMIT 1"
+                    "SELECT 1 FROM gpkg_contents "
+                    "WHERE data_type='features' LIMIT 1"
                 ).fetchone()
+
                 if content_row is None:
-                    raise ValueError("The registered GeoPackage contains no vector feature table.")
+                    raise ValueError(
+                        "The registered GeoPackage contains no vector feature table."
+                    )
+
         except sqlite3.DatabaseError as error:
-            raise ValueError("The registered vector output is not a readable GeoPackage.") from error
+            raise ValueError(
+                "The registered vector output is not a readable GeoPackage."
+            ) from error
+
     else:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ValueError("The registered metadata output is not valid UTF-8 JSON.") from error
+            raise ValueError(
+                "The registered metadata output is not valid UTF-8 JSON."
+            ) from error
+
         if not isinstance(payload, dict):
-            raise ValueError("The registered metadata output must contain a JSON object.")
+            raise ValueError(
+                "The registered metadata output must contain a JSON object."
+            )
+
 
 
 def _verify_output_unchanged(output: IntegrationOutput) -> Path:

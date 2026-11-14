@@ -15,6 +15,8 @@ from app.schemas.acquisitions import (
     AcquisitionStatus,
     NisarComponentSensitivityRequest,
     NisarComponentSensitivityResult,
+    NisarMetadataRegistrationRequest,
+    NisarMetadataRegistrationResult,
     NisarProcessingResult,
 )
 from app.schemas.ai_analysis import RiverAnalysisRequest, RiverAnalysisResponse
@@ -191,6 +193,27 @@ async def search_satellite(
 @router.get("/acquisitions", response_model=AcquisitionStatus, tags=["satellite"])
 def get_acquisitions() -> AcquisitionStatus:
     return acquisitions.get_catalog_status()
+
+
+@router.post(
+    "/acquisitions/nisar/metadata",
+    response_model=NisarMetadataRegistrationResult,
+    tags=["satellite"],
+)
+def register_nisar_metadata(
+    request: NisarMetadataRegistrationRequest,
+) -> NisarMetadataRegistrationResult:
+    try:
+        return acquisitions.register_nisar_product_metadata(
+            request.river_id,
+            request.product_id,
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except acquisitions.NisarMetadataLookupError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
 
 
 @router.get(

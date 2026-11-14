@@ -23,6 +23,7 @@ from app.schemas.acquisitions import (
     AcquisitionIssue,
     AcquiredObservation,
     AcquisitionStatus,
+    NisarMetadataRegistrationResult,
     NisarProduct,
     RiverAcquisitionStatus,
 )
@@ -61,6 +62,10 @@ _NISAR_DOWNLOAD_LOCK = threading.Lock()
 
 
 class NisarProcessingBusy(RuntimeError):
+    pass
+
+
+class NisarMetadataLookupError(RuntimeError):
     pass
 
 
@@ -482,13 +487,14 @@ def _provider_checksum(properties: dict[str, Any]) -> tuple[str | None, str | No
         ("md5sum", "md5"),
         ("md5Checksum", "md5"),
     ):
-        if key in properties:
-            candidates.append((algorithm, properties[key]))
+        value = properties.get(key)
+        if value is not None and str(value).strip():
+            candidates.append((algorithm, value))
     nested = properties.get("checksum")
     if isinstance(nested, dict):
         algorithm = str(nested.get("algorithm", "")).casefold().replace("-", "")
         value = nested.get("value")
-        if algorithm in {"sha256", "md5"}:
+        if algorithm in {"sha256", "md5"} and value is not None and str(value).strip():
             candidates.append((algorithm, value))
     elif isinstance(nested, str):
         match = re.fullmatch(r"(?i)(sha-?256|md5):([0-9a-f]+)", nested.strip())
@@ -530,15 +536,19 @@ def _nisar_product_metadata(feature: dict[str, Any], authenticated: bool) -> dic
     checksum_algorithm, checksum_value = _provider_checksum(properties)
     return {
         "product_id": product_id,
+        "platform": properties.get("platform"),
         "acquisition_start": start.isoformat() if start else None,
         "acquisition_end": end.isoformat() if end else None,
         "product_level": str(product_level),
+        "processing_type": properties.get("processingType"),
         "product_type": "GCOV",
         "polarization": polarization,
         "size_bytes": _nisar_size_bytes(properties, product_url),
         "availability": "authenticated_catalog" if authenticated else "authentication_required",
         "download_status": "not_attempted",
         "source_url": _source_url_reference(product_url),
+        "footprint": feature.get("geometry"),
+        "metadata_source": "ASF DAAC",
         "_download_url": product_url,
         "provider_checksum_algorithm": checksum_algorithm,
         "provider_checksum": checksum_value,
@@ -569,6 +579,330 @@ def _search_nisar_product_by_id(product_id: str, session: Any) -> dict[str, Any]
             f"ASF product metadata lookup failed ({type(error).__name__}); provider details were omitted."
         ) from None
     raise FileNotFoundError("ASF did not return the requested NISAR product metadata.")
+
+
+def _fetch_nisar_metadata_feature(product_id: str) -> dict[str, Any]:
+    try:
+        response = httpx.get(
+            ASF_SEARCH_URL,
+            params={"granule_list": product_id, "output": "geojson"},
+            headers={"User-Agent": "SAR-Sentinel-India/0.1"},
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        LOGGER.warning(
+            "ASF NISAR metadata registration lookup failed (%s).",
+            type(error).__name__,
+        )
+        raise NisarMetadataLookupError(
+            "ASF metadata lookup failed; no product was registered."
+        ) from None
+
+    if isinstance(payload, dict) and payload.get("type") == "Feature":
+        features = [payload]
+    elif isinstance(payload, dict) and isinstance(payload.get("features"), list):
+        features = payload["features"]
+    else:
+        raise NisarMetadataLookupError(
+            "ASF returned an invalid metadata response; no product was registered."
+        )
+
+    matches = [
+        feature
+        for feature in features
+        if isinstance(feature, dict)
+        and isinstance(feature.get("properties"), dict)
+        and (
+            feature["properties"].get("fileID") == product_id
+            or feature.get("id") == product_id
+        )
+    ]
+    if not matches:
+        raise FileNotFoundError("ASF did not return the explicitly requested NISAR product.")
+    if len(matches) != 1:
+        raise NisarMetadataLookupError(
+            "ASF returned ambiguous metadata for the requested product; no product was registered."
+        )
+    return matches[0]
+
+
+def _geometry_coverage_percent(
+    footprint_geojson: dict[str, Any],
+    area_of_interest: Any,
+    projected_crs: str,
+) -> float:
+    from rasterio.warp import transform_geom
+    from shapely.geometry import shape
+
+    projected_footprint = shape(
+        transform_geom(
+            "EPSG:4326",
+            projected_crs,
+            footprint_geojson,
+            precision=12,
+        )
+    )
+    if not projected_footprint.is_valid or projected_footprint.area <= 0:
+        raise ValueError("The ASF product footprint is invalid after projection.")
+    if not area_of_interest.is_valid or area_of_interest.area <= 0:
+        raise ValueError("The configured river corridor is invalid for coverage assessment.")
+    return min(
+        100.0,
+        max(
+            0.0,
+            100.0
+            * area_of_interest.intersection(projected_footprint).area
+            / area_of_interest.area,
+        ),
+    )
+
+
+def _validate_nisar_registration_metadata(
+    feature: dict[str, Any],
+    river_id: str,
+    requested_product_id: str,
+) -> tuple[dict[str, Any], float]:
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("ASF metadata is missing product properties.")
+
+    metadata_product_id = properties.get("fileID") or feature.get("id")
+    feature_product_id = feature.get("id")
+    if (
+        metadata_product_id != requested_product_id
+        or (
+            feature_product_id is not None
+            and feature_product_id != requested_product_id
+        )
+        or (
+            properties.get("fileID") is not None
+            and feature_product_id is not None
+            and properties["fileID"] != feature_product_id
+        )
+    ):
+        raise ValueError("ASF metadata does not match the explicitly requested product ID.")
+    if not NISAR_PRODUCT_ID.fullmatch(requested_product_id):
+        raise ValueError("The product ID is not a NISAR L2 GCOV identifier.")
+    if str(properties.get("platform", "")).strip().upper() != "NISAR":
+        raise ValueError("ASF metadata does not identify the NISAR platform.")
+    processing_type = properties.get("processingType")
+    if (
+        processing_type is not None
+        and str(processing_type).strip().upper() != "L2"
+    ):
+        raise ValueError("ASF metadata does not identify processing type L2.")
+    if str(properties.get("processingLevel", "")).strip().upper() != "GCOV":
+        raise ValueError("ASF metadata does not identify the GCOV processing level.")
+
+    acquisition_start = _timestamp(properties.get("startTime"))
+    acquisition_end = _timestamp(properties.get("stopTime"))
+    if (
+        acquisition_start is None
+        or acquisition_end is None
+        or acquisition_end < acquisition_start
+    ):
+        raise ValueError("ASF metadata contains invalid acquisition start or end times.")
+
+    product_url = properties.get("url")
+    if (
+        not isinstance(product_url, str)
+        or not _is_approved_nisar_url(product_url)
+        or Path(urlparse(product_url).path).name != f"{requested_product_id}.h5"
+    ):
+        raise ValueError("ASF metadata contains an invalid NISAR product URL.")
+
+    footprint = feature.get("geometry")
+    if not isinstance(footprint, dict) or footprint.get("type") not in {
+        "Polygon",
+        "MultiPolygon",
+    }:
+        raise ValueError("ASF metadata is missing a polygonal product footprint.")
+    from shapely.geometry import shape
+
+    footprint_shape = shape(footprint)
+    if not footprint_shape.is_valid or footprint_shape.is_empty or footprint_shape.area <= 0:
+        raise ValueError("ASF metadata contains an invalid product footprint.")
+
+    from app.services.satellite import _projected_river_corridor
+
+    projected_crs, corridor = _projected_river_corridor(river_id)
+    coverage_percent = _geometry_coverage_percent(
+        footprint,
+        corridor,
+        projected_crs,
+    )
+    if coverage_percent <= 0:
+        raise ValueError(
+            "The ASF product footprint does not overlap the selected river's 1,500 m corridor."
+        )
+
+    product = _nisar_product_metadata(feature, authenticated=False)
+    if product is None:
+        raise ValueError("ASF metadata is missing required NISAR product fields.")
+    product.update(
+        {
+            "availability": "metadata_registered",
+            "download_status": "not_attempted",
+            "local_path": None,
+            "hdf5_groups": [],
+            "corridor_coverage_percent": coverage_percent,
+            "message": (
+                "ASF metadata only; no HDF5 bytes were downloaded. Corridor coverage is "
+                "reported as an area fraction, and coverage sufficiency is not assessed."
+            ),
+        }
+    )
+    return product, coverage_percent
+
+
+def _merge_registered_nisar_metadata(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    provenance_fields = (
+        "platform",
+        "acquisition_start",
+        "acquisition_end",
+        "product_level",
+        "processing_type",
+        "product_type",
+        "polarization",
+        "size_bytes",
+        "footprint",
+        "corridor_coverage_percent",
+        "metadata_source",
+        "source_url",
+        "provider_checksum_algorithm",
+        "provider_checksum",
+    )
+    for field in provenance_fields:
+        if merged.get(field) is None and incoming.get(field) is not None:
+            merged[field] = incoming[field]
+    return merged
+
+
+def _store_registered_nisar_metadata(
+    river_id: str,
+    product: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    product_id = product["product_id"]
+    with _catalog_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT nisar_products_json, nisar_product_id
+            FROM river_scans
+            WHERE river_id=?
+            """,
+            (river_id,),
+        ).fetchone()
+        products = json.loads(row["nisar_products_json"] or "[]") if row else []
+        if not isinstance(products, list) or any(not isinstance(item, dict) for item in products):
+            raise RuntimeError("The river's NISAR catalog metadata is malformed.")
+        pointed_product = next(
+            (
+                item
+                for item in products
+                if row and item.get("product_id") == row["nisar_product_id"]
+            ),
+            None,
+        )
+        preserve_river_pointer = pointed_product is not None and (
+            pointed_product.get("download_status") == "downloaded"
+            or pointed_product.get("processing_status") == "processed"
+        )
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(products)
+                if item.get("product_id") == product_id
+            ),
+            None,
+        )
+        if existing_index is not None:
+            existing = products[existing_index]
+            merged = _merge_registered_nisar_metadata(existing, product)
+            if merged != existing:
+                products[existing_index] = merged
+                connection.execute(
+                    "UPDATE river_scans SET nisar_products_json=? WHERE river_id=?",
+                    (json.dumps(_catalog_product_records(products)), river_id),
+                )
+            return "already_registered", merged
+
+        products.append(product)
+        serialized_products = json.dumps(_catalog_product_records(products))
+        if row:
+            if preserve_river_pointer:
+                connection.execute(
+                    "UPDATE river_scans SET nisar_products_json=? WHERE river_id=?",
+                    (serialized_products, river_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE river_scans
+                    SET nisar_products_json=?, nisar_status='metadata_found',
+                        nisar_product_id=?, nisar_acquisition_start=?, nisar_message=?
+                    WHERE river_id=?
+                    """,
+                    (
+                        serialized_products,
+                        product_id,
+                        product["acquisition_start"],
+                        product["message"],
+                        river_id,
+                    ),
+                )
+        else:
+            connection.execute(
+                """
+                INSERT INTO river_scans (
+                    river_id, status, nisar_status, nisar_product_id,
+                    nisar_acquisition_start, nisar_message, nisar_products_json,
+                    nisar_authentication_status, candidate_count
+                ) VALUES (?, 'idle', 'metadata_found', ?, ?, ?, ?, 'unknown', 0)
+                """,
+                (
+                    river_id,
+                    product_id,
+                    product["acquisition_start"],
+                    product["message"],
+                    serialized_products,
+                ),
+            )
+        return "registered", product
+
+
+def register_nisar_product_metadata(
+    river_id: str,
+    product_id: str,
+) -> NisarMetadataRegistrationResult:
+    if river_id not in {river.id for river in RIVER_CATALOG}:
+        raise ValueError(f"Unsupported river_id: {river_id}")
+    if not isinstance(product_id, str) or not NISAR_PRODUCT_ID.fullmatch(product_id):
+        raise ValueError("The product ID is not a NISAR L2 GCOV identifier.")
+
+    feature = _fetch_nisar_metadata_feature(product_id)
+    product, coverage_percent = _validate_nisar_registration_metadata(
+        feature,
+        river_id,
+        product_id,
+    )
+    registration_status, stored_product = _store_registered_nisar_metadata(
+        river_id,
+        product,
+    )
+    return NisarMetadataRegistrationResult(
+        river_id=river_id,
+        product=NisarProduct.model_validate(stored_product),
+        registration_status=registration_status,
+        corridor_intersects=True,
+        corridor_coverage_percent=coverage_percent,
+    )
 
 
 def _record_verified_nisar_product(
@@ -2791,15 +3125,34 @@ def process_nisar_product(river_id: str, product_id: str) -> dict[str, Any]:
         product, product_path = _nisar_product_record(river_id, product_id)
         if product.get("processing_status") in {"processed", "no_data"} and product.get("processing_result"):
             result = product["processing_result"]
+            provenance_fields = (
+                "input_measurement_convention",
+                "input_backscatter_normalization_convention",
+                "input_backscatter_expression_convention",
+                "power_to_db_conversion",
+                "power_to_db_floor_linear",
+                "power_to_db_floor_db",
+            )
+            provenance = {}
+            if any(result.get(key) is None for key in provenance_fields):
+                from app.services.nisar_gcov import read_input_measurement_provenance
+
+                provenance = read_input_measurement_provenance(product_path)
+            provenance_changed = any(result.get(key) != value for key, value in provenance.items())
+            result.update(provenance)
+            metadata_path = product_path.parent / "nisar-processing" / "processing-metadata.json"
             if result.get("status") == "no_valid_corridor_data":
                 result["mask_url"] = None
                 result["measurements_url"] = None
                 result["polygons_url"] = None
                 product["processing_result"] = result
                 _save_nisar_product_record(river_id, product_id, product)
+                if provenance_changed and metadata_path.is_file():
+                    metadata_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
             elif result.get("status") == "unvalidated_candidate":
                 from app.services.nisar_gcov import CLASSIFICATION_ALGORITHM
 
+                diagnostics_changed = False
                 if (
                     not result.get("connected_component_summary")
                     or result.get("algorithm") != CLASSIFICATION_ALGORITHM
@@ -2810,12 +3163,12 @@ def process_nisar_product(river_id: str, product_id: str) -> dict[str, Any]:
                         river_id,
                         product_id,
                     )
+                    diagnostics_changed = True
+                result.update(provenance)
+                if diagnostics_changed or provenance_changed:
                     product["processing_result"] = result
                     _save_nisar_product_record(river_id, product_id, product)
-                    (product_path.parent / "nisar-processing" / "processing-metadata.json").write_text(
-                        json.dumps(result, indent=2),
-                        encoding="utf-8",
-                    )
+                    metadata_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
             return product["processing_result"]
         if product.get("download_status") != "downloaded":
             raise ValueError("Only a downloaded and HDF5-verified NISAR product can be processed.")

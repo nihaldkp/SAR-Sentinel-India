@@ -18,10 +18,14 @@ CORRIDOR_HALF_WIDTH_M = 1_500.0
 HISTOGRAM_MIN_DB = -60.0
 HISTOGRAM_MAX_DB = 30.0
 HISTOGRAM_BINS = 900
+POWER_TO_DB_FLOOR_LINEAR = 1e-6
+POWER_TO_DB_FLOOR_DB = 10.0 * math.log10(POWER_TO_DB_FLOOR_LINEAR)
+POWER_TO_DB_CONVERSION = "10*log10(max(power, 1e-6))"
 THRESHOLD_SENSITIVITY_DB = 1.0
 THRESHOLD_OFFSETS_DB = (-2.0, -1.0, 0.0, 1.0, 2.0)
 CLASSIFICATION_ALGORITHM = (
-    "Convert linear frequency-A HHHH and HVHV power to 10*log10(max(power, 1e-6)) dB; "
+    "Convert frequency-A gamma0 linear-power HHHH and HVHV to "
+    "10*log10(max(power, 1e-6)) dB; "
     "estimate independent Otsu thresholds from 900-bin histograms spanning -60 to +30 dB; "
     "classify the combined candidate where HH_dB <= HH_threshold AND HV_dB <= HV_threshold."
 )
@@ -86,8 +90,52 @@ def _otsu_threshold(histogram: np.ndarray, edges: np.ndarray) -> float:
 
 
 def _db(power: np.ndarray) -> np.ndarray:
-    floor = 10.0 ** (HISTOGRAM_MIN_DB / 10.0)
-    return (10.0 * np.log10(np.maximum(power, floor))).astype(np.float32, copy=False)
+    return (
+        10.0 * np.log10(np.maximum(power, POWER_TO_DB_FLOOR_LINEAR))
+    ).astype(np.float32, copy=False)
+
+
+def _input_measurement_provenance(source: Any) -> dict[str, Any]:
+    normalization_path = (
+        "science/LSAR/GCOV/metadata/processingInformation/parameters/rtc/"
+        "outputBackscatterNormalizationConvention"
+    )
+    expression_path = (
+        "science/LSAR/GCOV/metadata/processingInformation/parameters/rtc/"
+        "outputBackscatterExpressionConvention"
+    )
+    if normalization_path not in source or expression_path not in source:
+        raise ValueError("GCOV product is missing backscatter convention metadata.")
+
+    def text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="strict").strip()
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                raise ValueError("GCOV backscatter convention metadata must be scalar.")
+            return text(value.item())
+        return str(value).strip()
+
+    normalization = text(source[normalization_path][()])
+    expression = text(source[expression_path][()])
+    if normalization.casefold() != "gamma0" or expression.casefold() != "linear power":
+        raise ValueError(
+            "NISAR GCOV processing requires gamma0 measurements expressed as linear power."
+        )
+    return {
+        "input_measurement_convention": "gamma0 linear power",
+        "input_backscatter_normalization_convention": normalization,
+        "input_backscatter_expression_convention": expression,
+        "power_to_db_conversion": POWER_TO_DB_CONVERSION,
+        "power_to_db_floor_linear": POWER_TO_DB_FLOOR_LINEAR,
+        "power_to_db_floor_db": POWER_TO_DB_FLOOR_DB,
+    }
+
+
+def read_input_measurement_provenance(hdf5_path: Path) -> dict[str, Any]:
+    h5py, _, _, _, _ = _require_modules()
+    with h5py.File(hdf5_path, "r") as source:
+        return _input_measurement_provenance(source)
 
 
 def _tiles(height: int, width: int) -> Iterator[tuple[int, int, int, int]]:
@@ -636,6 +684,7 @@ def process_gcov_product(
 
     with h5py.File(hdf5_path, "r") as source:
         _, polarizations = validate_nisar_gcov_hdf5(source, product_id)
+        input_measurement_provenance = _input_measurement_provenance(source)
         base = f"science/LSAR/GCOV/grids/{FREQUENCY}/"
         required_paths = {
             "hh": base + "HHHH",
@@ -761,6 +810,7 @@ def process_gcov_product(
                     "No classification performed: no paired, fully focused frequency-A HH/HV pixels "
                     "were available inside the mapped river corridor."
                 ),
+                **input_measurement_provenance,
                 "frequency": FREQUENCY,
                 "dataset_paths": {
                     "hh": required_paths["hh"],
@@ -935,6 +985,7 @@ def process_gcov_product(
                 "status": "unvalidated_candidate",
                 "processor_version": PROCESSOR_VERSION,
                 "algorithm": CLASSIFICATION_ALGORITHM,
+                **input_measurement_provenance,
                 "frequency": FREQUENCY,
                 "dataset_paths": {
                     "hh": required_paths["hh"],

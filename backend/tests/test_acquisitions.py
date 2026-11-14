@@ -1,8 +1,9 @@
 import json
+import sys
 import uuid
 from typing import Any
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import httpx
 import numpy as np
@@ -15,6 +16,98 @@ from app.services.nisar_gcov import NisarGcovProcessingUnavailable
 
 client = TestClient(app)
 TEST_NISAR_PRODUCT_ID = "NISAR_L2_UR_GCOV_TEST_001"
+
+
+def _polygon_footprint(
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+) -> dict[str, Any]:
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+            [min_x, min_y],
+        ]],
+    }
+
+
+def _registration_feature(
+    product_id: str = TEST_NISAR_PRODUCT_ID,
+    footprint: Any | None = None,
+    **property_overrides: Any,
+) -> dict[str, Any]:
+    if footprint is None:
+        footprint = _polygon_footprint(77, 15.5, 79, 16.5)
+    properties = {
+        "fileID": product_id,
+        "platform": "NISAR",
+        "processingType": "L2",
+        "processingLevel": "GCOV",
+        "url": (
+            "https://nisar.asf.earthdatacloud.nasa.gov/test/"
+            f"{product_id}.h5?X-Amz-Signature=private"
+        ),
+        "startTime": "2026-11-06T00:25:20Z",
+        "stopTime": "2026-11-06T00:25:55Z",
+        "polarization": ["HH", "HV"],
+        "bytes": {f"{product_id}.h5": {"bytes": 1024}},
+        "sha256sum": "a" * 64,
+        **property_overrides,
+    }
+    return {
+        "type": "Feature",
+        "id": product_id,
+        "geometry": footprint,
+        "properties": properties,
+    }
+
+
+def _install_nisar_registration_fakes(
+    monkeypatch: Any,
+    tmp_path: Path,
+    feature: dict[str, Any],
+) -> list[dict[str, Any]]:
+    from shapely.geometry import box
+    from app.services import satellite
+
+    calls: list[dict[str, Any]] = []
+    rasterio_module = ModuleType("rasterio")
+    setattr(rasterio_module, "__path__", [])
+    warp_module = ModuleType("rasterio.warp")
+    warp_module.transform_geom = lambda _source, _target, geometry, **_kwargs: geometry
+    monkeypatch.setitem(sys.modules, "rasterio", rasterio_module)
+    monkeypatch.setitem(sys.modules, "rasterio.warp", warp_module)
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"type": "FeatureCollection", "features": [feature]}
+
+    def get(url: str, **kwargs: Any) -> Response:
+        calls.append({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(acquisitions, "CATALOG_PATH", tmp_path / "catalog.sqlite3")
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "acquisitions")
+    monkeypatch.setattr(acquisitions.httpx, "get", get)
+    monkeypatch.setattr(
+        satellite,
+        "_projected_river_corridor",
+        lambda river_id: (
+            "EPSG:4326",
+            box(76, 15, 78, 17),
+        )
+        if river_id == "tungabhadra"
+        else pytest.fail(f"Unexpected river ID: {river_id}"),
+    )
+    return calls
 
 
 def _write_minimal_nisar_product(path: Path, product_id: str) -> None:
@@ -47,6 +140,303 @@ def _write_minimal_nisar_product(path: Path, product_id: str) -> None:
         grid.create_dataset("yCoordinateSpacing", data=np.float64(-1.0))
         grid.create_dataset("listOfPolarizations", data=np.asarray([b"HH", b"HV"], dtype="S2"))
         grid.create_dataset("projection", data=np.uint32(32643)).attrs["epsg_code"] = 32643
+
+
+def test_register_nisar_metadata_is_metadata_only_and_preserves_provenance(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature()
+    calls = _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+    monkeypatch.setattr(
+        acquisitions,
+        "_download_nisar_product",
+        lambda *_args, **_kwargs: pytest.fail("Registration must not start a download."),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        acquisitions,
+        "automatic_acquisition_enabled",
+        lambda: pytest.fail("Registration must not inspect or start automatic acquisition."),
+    )
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["registration_status"] == "registered"
+    assert result["coverage_basis"] == "buffered_centerline_corridor"
+    assert result["coverage_sufficiency"] == "not_assessed"
+    assert result["corridor_coverage_percent"] == pytest.approx(25.0)
+    assert result["product"]["product_id"] == TEST_NISAR_PRODUCT_ID
+    assert result["product"]["platform"] == "NISAR"
+    assert result["product"]["processing_type"] == "L2"
+    assert result["product"]["product_level"] == "GCOV"
+    assert result["product"]["size_bytes"] == 1024
+    assert result["product"]["provider_checksum"] == "a" * 64
+    assert result["product"]["provider_checksum_algorithm"] == "sha256"
+    assert result["product"]["local_path"] is None
+    assert result["product"]["download_status"] == "not_attempted"
+    assert "X-Amz-Signature" not in response.text
+    assert "private" not in response.text
+    assert len(calls) == 1
+    assert calls[0]["url"] == acquisitions.ASF_SEARCH_URL
+    assert calls[0]["params"]["granule_list"] == TEST_NISAR_PRODUCT_ID
+    assert not (tmp_path / "acquisitions").exists()
+
+    with acquisitions._catalog_connection() as connection:
+        row = connection.execute(
+            "SELECT nisar_products_json FROM river_scans WHERE river_id='tungabhadra'"
+        ).fetchone()
+    stored = json.loads(row["nisar_products_json"])[0]
+    assert stored["source_url"] == (
+        "https://nisar.asf.earthdatacloud.nasa.gov/test/"
+        f"{TEST_NISAR_PRODUCT_ID}.h5"
+    )
+    assert "_download_url" not in stored
+    assert "private" not in json.dumps(stored)
+
+
+def test_register_nisar_metadata_rejects_invalid_id_without_lookup(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        acquisitions.httpx,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("Invalid IDs must be rejected before lookup."),
+    )
+    monkeypatch.setattr(acquisitions, "CATALOG_PATH", tmp_path / "catalog.sqlite3")
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": "not-a-nisar-product"},
+    )
+
+    assert response.status_code == 422
+    assert "NISAR L2 GCOV" in response.json()["detail"]
+    assert not (tmp_path / "catalog.sqlite3").exists()
+
+
+def test_register_nisar_metadata_rejects_invalid_asf_identity(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature(processingType="L1")
+    _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 422
+    assert "processing type L2" in response.json()["detail"]
+    assert not (tmp_path / "catalog.sqlite3").exists()
+
+
+def test_register_nisar_metadata_accepts_asf_record_without_processing_type(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature()
+    feature["properties"].pop("processingType")
+    feature["properties"].pop("sha256sum")
+    feature["properties"]["md5sum"] = None
+    _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["product"]["processing_type"] is None
+    assert response.json()["product"]["provider_checksum"] is None
+
+
+def test_register_nisar_metadata_rejects_malformed_nonempty_checksum(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature(sha256sum="not-a-valid-checksum")
+    _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 422
+    assert "malformed provider checksum" in response.json()["detail"]
+    assert not (tmp_path / "catalog.sqlite3").exists()
+
+
+def test_register_nisar_metadata_rejects_nonintersecting_corridor(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    outside_footprint = _polygon_footprint(79, 15, 80, 16)
+    feature = _registration_feature(footprint=outside_footprint)
+    _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 422
+    assert "does not overlap" in response.json()["detail"]
+    assert not (tmp_path / "catalog.sqlite3").exists()
+
+
+def test_register_nisar_metadata_failure_is_safe_and_does_not_register(
+    monkeypatch: Any,
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    secret = "metadata-test-secret"
+
+    def fail_lookup(*_args: Any, **_kwargs: Any) -> None:
+        raise httpx.ConnectError(f"request failed with token={secret}")
+
+    monkeypatch.setattr(acquisitions, "CATALOG_PATH", tmp_path / "catalog.sqlite3")
+    monkeypatch.setattr(acquisitions.httpx, "get", fail_lookup)
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={"river_id": "tungabhadra", "product_id": TEST_NISAR_PRODUCT_ID},
+    )
+
+    assert response.status_code == 502
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert not (tmp_path / "catalog.sqlite3").exists()
+
+
+def test_duplicate_nisar_registration_preserves_existing_download_state(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature()
+    calls = _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+    request = {
+        "river_id": "tungabhadra",
+        "product_id": TEST_NISAR_PRODUCT_ID,
+    }
+
+    first = client.post("/api/acquisitions/nisar/metadata", json=request)
+    duplicate = client.post("/api/acquisitions/nisar/metadata", json=request)
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert duplicate.json()["registration_status"] == "already_registered"
+
+    with acquisitions._catalog_connection() as connection:
+        row = connection.execute(
+            "SELECT nisar_products_json FROM river_scans WHERE river_id='tungabhadra'"
+        ).fetchone()
+        stored = json.loads(row["nisar_products_json"])
+        stored[0].update(
+            {
+                "download_status": "downloaded",
+                "local_path": "data/acquisitions/tungabhadra/product.h5",
+                "processing_status": "processed",
+            }
+        )
+        connection.execute(
+            "UPDATE river_scans SET nisar_products_json=? WHERE river_id='tungabhadra'",
+            (json.dumps(stored),),
+        )
+
+    repeated = client.post("/api/acquisitions/nisar/metadata", json=request)
+
+    assert repeated.status_code == 200
+    assert repeated.json()["registration_status"] == "already_registered"
+    with acquisitions._catalog_connection() as connection:
+        row = connection.execute(
+            "SELECT nisar_products_json FROM river_scans WHERE river_id='tungabhadra'"
+        ).fetchone()
+    stored = json.loads(row["nisar_products_json"])
+    assert len(stored) == 1
+    assert stored[0]["download_status"] == "downloaded"
+    assert stored[0]["local_path"] == "data/acquisitions/tungabhadra/product.h5"
+    assert stored[0]["processing_status"] == "processed"
+    assert len(calls) == 3
+
+
+def test_new_nisar_registration_preserves_existing_meaningful_river_pointer(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    feature = _registration_feature()
+    _install_nisar_registration_fakes(monkeypatch, tmp_path, feature)
+    existing_product_id = "NISAR_L2_UR_GCOV_EXISTING_001"
+    existing_acquisition_start = "2026-10-01T12:00:00+00:00"
+    existing_product = {
+        "product_id": existing_product_id,
+        "acquisition_start": existing_acquisition_start,
+        "product_level": "GCOV",
+        "availability": "downloaded_verified",
+        "download_status": "downloaded",
+        "local_path": "data/acquisitions/tungabhadra/existing.h5",
+        "processing_status": "processed",
+    }
+
+    with acquisitions._catalog_connection() as connection:
+        acquisitions._write_scan(
+            connection,
+            "tungabhadra",
+            "processed",
+            {
+                "status": "authentication_required",
+                "product_id": existing_product_id,
+                "acquisition_start": existing_acquisition_start,
+                "message": "Existing product remains the active river pointer.",
+                "products": [existing_product],
+            },
+            0,
+            None,
+        )
+
+    response = client.post(
+        "/api/acquisitions/nisar/metadata",
+        json={
+            "river_id": "tungabhadra",
+            "product_id": TEST_NISAR_PRODUCT_ID,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["registration_status"] == "registered"
+    with acquisitions._catalog_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT status, nisar_status, nisar_product_id,
+                   nisar_acquisition_start, nisar_message, nisar_products_json
+            FROM river_scans
+            WHERE river_id='tungabhadra'
+            """
+        ).fetchone()
+
+    stored_products = json.loads(row["nisar_products_json"])
+    stored_existing = next(
+        item for item in stored_products if item["product_id"] == existing_product_id
+    )
+    assert row["status"] == "processed"
+    assert row["nisar_status"] == "authentication_required"
+    assert row["nisar_product_id"] == existing_product_id
+    assert row["nisar_acquisition_start"] == existing_acquisition_start
+    assert row["nisar_message"] == "Existing product remains the active river pointer."
+    assert stored_existing["download_status"] == "downloaded"
+    assert stored_existing["processing_status"] == "processed"
+    assert stored_existing["local_path"] == existing_product["local_path"]
+    assert any(
+        item["product_id"] == TEST_NISAR_PRODUCT_ID
+        for item in stored_products
+    )
 
 
 def test_automatic_acquisition_is_opt_in(monkeypatch: Any) -> None:
@@ -1396,7 +1786,7 @@ def test_nisar_processing_api_persists_result_and_serves_outputs(
             "product_id": product_id,
             "status": "unvalidated_candidate",
             "processor_version": "test",
-            "algorithm": "fixture",
+            "algorithm": nisar_gcov.CLASSIFICATION_ALGORITHM,
             "frequency": "frequencyA",
             "dataset_paths": {"hh": "HHHH", "hv": "HVHV"},
             "polarization": ["HH", "HV"],
@@ -1446,6 +1836,18 @@ def test_nisar_processing_api_persists_result_and_serves_outputs(
         return result
 
     monkeypatch.setattr(nisar_gcov, "process_gcov_product", fake_process)
+    monkeypatch.setattr(
+        nisar_gcov,
+        "read_input_measurement_provenance",
+        lambda _: {
+            "input_measurement_convention": "gamma0 linear power",
+            "input_backscatter_normalization_convention": "gamma0",
+            "input_backscatter_expression_convention": "Linear power",
+            "power_to_db_conversion": "10*log10(max(power, 1e-6))",
+            "power_to_db_floor_linear": 1e-6,
+            "power_to_db_floor_db": -60.0,
+        },
+    )
     monkeypatch.setattr(acquisitions, "_attach_nisar_quality_diagnostics", fake_quality_diagnostics)
     endpoint = f"/api/acquisitions/nisar/{product_id}"
     response = client.post(f"{endpoint}/process", params={"river_id": "tungabhadra"})
@@ -1458,7 +1860,17 @@ def test_nisar_processing_api_persists_result_and_serves_outputs(
     cached_result = acquisitions.process_nisar_product("tungabhadra", product_id)
     assert cached_result["candidate_water_area_m2"] == result["candidate_water_area_m2"]
     assert cached_result["processing_completed_at"] == "2026-11-09T00:00:00+00:00"
+    assert cached_result["input_measurement_convention"] == "gamma0 linear power"
+    assert cached_result["power_to_db_conversion"] == "10*log10(max(power, 1e-6))"
     assert processing_calls == [product_id]
+    saved_metadata = json.loads(
+        (
+            source_path.parent
+            / "nisar-processing"
+            / "processing-metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert saved_metadata["power_to_db_floor_db"] == -60
 
     catalog = client.get("/api/acquisitions")
     assert catalog.status_code == 200
