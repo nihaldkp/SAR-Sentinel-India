@@ -119,6 +119,12 @@ def test_process_small_gcov_fixture_preserves_georeferencing_and_nodata(
     )
 
     assert result["status"] == "unvalidated_candidate"
+    metadata = json.loads(
+        (tmp_path / "processing" / "processing-metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["scientific_validation_status"] == "not_performed"
     assert result["dataset_paths"]["hh"].endswith("/HHHH")
     assert result["dataset_paths"]["hv"].endswith("/HVHV")
     assert result["input_crs"] == "EPSG:32643"

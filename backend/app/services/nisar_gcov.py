@@ -805,6 +805,7 @@ def process_gcov_product(
                 "river_id": river_id,
                 "product_id": product_id,
                 "status": "no_valid_corridor_data",
+                "scientific_validation_status": "not_performed",
                 "processor_version": PROCESSOR_VERSION,
                 "algorithm": (
                     "No classification performed: no paired, fully focused frequency-A HH/HV pixels "
@@ -983,6 +984,7 @@ def process_gcov_product(
                 "river_id": river_id,
                 "product_id": product_id,
                 "status": "unvalidated_candidate",
+                "scientific_validation_status": "not_performed",
                 "processor_version": PROCESSOR_VERSION,
                 "algorithm": CLASSIFICATION_ALGORITHM,
                 **input_measurement_provenance,
