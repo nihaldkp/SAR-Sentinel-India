@@ -210,6 +210,7 @@ class NisarProduct(BaseModel):
     metadata_source: str | None = None
     availability: str
     download_status: str
+    artifact_availability: Literal["local_file_available", "metadata_only"] = "local_file_available"
     source_url: str | None = None
     source_url_reference: str | None = None
     local_path: str | None = None
@@ -360,7 +361,10 @@ class AcquisitionStatus(BaseModel):
     @property
     def nisar_connection_status(self) -> dict[str, object]:
         products = [p for river in self.rivers for p in river.nisar_products]
-        inspected = [p for p in products if p.download_status == "downloaded" and p.hdf5_groups]
+        local_products = [
+            p for p in products if p.artifact_availability == "local_file_available"
+        ]
+        inspected = [p for p in local_products if p.download_status == "downloaded" and p.hdf5_groups]
         processed = [p.processing_result for p in products if p.processing_result is not None]
         latest = max(
             (p for p in inspected if p.acquisition_start is not None and p.acquisition_start.utcoffset() is not None),
@@ -401,10 +405,13 @@ class AcquisitionStatus(BaseModel):
                 else None
             ),
             "last_successful_search": max(successful_searches, default=None),
-            "cached_product_count": len({p.product_id for p in products}),
-            "recorded_download_count": len({p.product_id for p in products if p.download_status == "downloaded"}),
+            "cached_product_count": len({p.product_id for p in local_products}),
+            "recorded_download_count": len({p.product_id for p in local_products if p.download_status == "downloaded"}),
             "recorded_inspection_count": len({p.product_id for p in inspected}),
             "recorded_processing_count": len({result.product_id for result in processed}),
+            "metadata_only_product_count": len(
+                {p.product_id for p in products if p.artifact_availability == "metadata_only"}
+            ),
             "latest_recorded_inspection_product_id": latest.product_id if latest else None,
             "latest_recorded_inspection_acquisition": latest.acquisition_start if latest else None,
             "latest_recorded_processing": (

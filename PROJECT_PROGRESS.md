@@ -6,6 +6,31 @@
 
 **Verified checklist completion:** 65 of 70 items (92.9%). This counts checked deliverables only and does not indicate scientific validation or overall product readiness.
 
+## 2026-11-15 — Render read-only NISAR catalogue bundle
+
+Added a small versioned production bundle sourced from the existing local
+SQLite acquisition metadata and NISAR processing sidecars. It includes the
+two Tungabhadra records only: A_009 remains an `unvalidated_candidate`, and
+A_010 remains `no_data`; Kaveri is represented only by its dated no-data scan.
+SHA-256 fingerprints, acquisition times, CRS/resolution, candidate coverage,
+and provenance labels are preserved. No raw HDF5 files or complete raster
+outputs are included.
+
+The backend falls back to this bundle when the runtime SQLite catalogue or
+local product files are absent, while preferring locally verified files and
+deduplicating by river/product ID. `/api/acquisitions` and the integration
+acquisition list expose the packaged statuses; A_009's existing capped
+display GeoJSON is served with its SHA-256 checked. Processing jobs fail
+clearly when only bundled metadata is available. The Render configuration
+still sets public read-only mode and disables automatic acquisition. No push,
+merge, or deployment was performed.
+
+Verification: backend **278 passed, 3 skipped**; Python compile check passed;
+frontend production build passed with the existing Vite chunk-size advisory;
+the targeted metadata-only NISAR Playwright test passed. Ruff was unavailable
+in the existing backend environment. These checks do not constitute a live
+Render deployment or scientific validation.
+
 ## 2026-11-15 — presentation-readiness audit
 
 Audited cached Agriculture downloads and corrected handling of older

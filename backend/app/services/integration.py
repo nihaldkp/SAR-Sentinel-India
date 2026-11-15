@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Generator, Protocol
+from typing import Any, Generator, Literal, Protocol
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ from app.schemas.integration import (
     VerifiedAcquisition,
 )
 from app.services import acquisitions
+from app.services import production_catalogue
 from app.services.rivers import RIVER_CATALOG
 
 LOGGER = logging.getLogger(__name__)
@@ -277,7 +278,7 @@ def _product_records(river_id: str | None = None) -> list[tuple[str, dict[str, A
 def _verified_acquisition(
     river_id: str,
     product_id: str,
-) -> tuple[VerifiedAcquisition, dict[str, Any], Path]:
+) -> tuple[VerifiedAcquisition, dict[str, Any], Path | None]:
     if river_id not in {river.id for river in RIVER_CATALOG}:
         raise ValueError(f"Unknown river_id: {river_id}")
     record = next(
@@ -289,9 +290,14 @@ def _verified_acquisition(
         None,
     )
     if record is None:
-        raise FileNotFoundError(
-            f"No locally present NISAR acquisition with recorded structure verification was found for {river_id}/{product_id}."
-        )
+        packaged = production_catalogue.get_record(river_id, product_id)
+        if packaged is None:
+            raise FileNotFoundError(
+                f"No locally present or packaged NISAR acquisition was found for {river_id}/{product_id}."
+            )
+        product = packaged.product
+        acquisition = _packaged_acquisition(packaged)
+        return acquisition, product.model_dump(mode="json"), None
     catalog_record, path = acquisitions._nisar_product_record(river_id, product_id)
     acquisition_start = record.get("acquisition_start")
     if not isinstance(acquisition_start, str):
@@ -324,12 +330,54 @@ def _verified_acquisition(
             ),
             provider_checksum_algorithm=record.get("provider_checksum_algorithm"),
             provider_checksum=record.get("provider_checksum"),
+            artifact_availability="local_file_available",
+            processing_status=_record_processing_status(record),
+            processing_result=record.get("processing_result"),
         )
     except (KeyError, TypeError, OSError, ValueError) as error:
         raise ValueError("The recorded NISAR verification metadata is incomplete or inconsistent.") from error
     if catalog_record.get("product_id") != verification.product_id:
         raise ValueError("The NISAR catalog identity does not match the requested product.")
     return verification, record, path
+
+
+def _record_processing_status(
+    record: dict[str, Any],
+) -> Literal["unvalidated_candidate", "no_data"] | None:
+    result = record.get("processing_result")
+    if isinstance(result, dict):
+        if result.get("status") == "unvalidated_candidate":
+            return "unvalidated_candidate"
+        if result.get("status") == "no_valid_corridor_data":
+            return "no_data"
+    return "no_data" if record.get("processing_status") == "no_data" else None
+
+
+def _packaged_acquisition(record: production_catalogue.ProductionNisarRecord) -> VerifiedAcquisition:
+    product = record.product
+    if product.acquisition_start is None or product.size_bytes is None or product.sha256 is None:
+        raise ValueError("The packaged NISAR acquisition metadata is incomplete.")
+    return VerifiedAcquisition(
+        river_id=record.river_id,
+        product_id=product.product_id,
+        product_type="GCOV",
+        acquisition_start=product.acquisition_start,
+        acquisition_end=product.acquisition_end,
+        file_reference=f"metadata-only://{record.river_id}/{product.product_id}",
+        file_size_bytes=product.size_bytes,
+        sha256=product.sha256,
+        integrity_status=product.integrity_status,
+        structure_verification_status="verified",
+        provider_authenticity_status=product.provider_authenticity_status,
+        scientific_validation_status="not_performed",
+        source_url_reference=_safe_source_reference(product.source_url_reference),
+        download_timestamp=product.download_timestamp,
+        provider_checksum_algorithm=product.provider_checksum_algorithm,
+        provider_checksum=product.provider_checksum,
+        artifact_availability="metadata_only",
+        processing_status=record.processing_status,
+        processing_result=product.processing_result,
+    )
 
 
 def list_verified_acquisitions(
@@ -341,11 +389,13 @@ def list_verified_acquisitions(
     if river_id is not None and river_id not in {river.id for river in RIVER_CATALOG}:
         raise ValueError(f"Unknown river_id: {river_id}")
     records = _product_records(river_id)
-    acquisitions_list = []
+    acquisitions_list: list[VerifiedAcquisition] = []
+    local_product_ids: set[tuple[str, str]] = set()
     for selected_river_id, record, path in records:
         start = record.get("acquisition_start")
         if not isinstance(start, str):
             continue
+        local_product_ids.add((selected_river_id, record["product_id"]))
         item = VerifiedAcquisition(
             river_id=selected_river_id,
             product_id=record["product_id"],
@@ -374,8 +424,18 @@ def list_verified_acquisitions(
             ),
             provider_checksum_algorithm=record.get("provider_checksum_algorithm"),
             provider_checksum=record.get("provider_checksum"),
+            artifact_availability="local_file_available",
+            processing_status=_record_processing_status(record),
+            processing_result=record.get("processing_result"),
         )
         acquisitions_list.append(item)
+    catalogue = production_catalogue.load_production_catalogue()
+    for packaged in catalogue.records:
+        if river_id is not None and packaged.river_id != river_id:
+            continue
+        key = (packaged.river_id, packaged.product.product_id)
+        if key not in local_product_ids:
+            acquisitions_list.append(_packaged_acquisition(packaged))
     acquisitions_list.sort(key=lambda item: item.acquisition_start, reverse=True)
     return {
         "total": len(acquisitions_list),
@@ -405,6 +465,7 @@ def get_acquisition_verification(
         provider_checksum_algorithm=acquisition.provider_checksum_algorithm,
         provider_checksum=acquisition.provider_checksum,
         scientific_validation_status="not_performed",
+        artifact_availability=acquisition.artifact_availability,
         verified_at=acquisition.download_timestamp,
         verification_scope="recorded_download_verification",
     )
@@ -598,7 +659,11 @@ def _create_job(
 def create_processing_job(request: ProcessingJobCreate) -> IntegrationJob:
     if request.river_id not in {river.id for river in RIVER_CATALOG}:
         raise ValueError(f"Unknown river_id: {request.river_id}")
-    _verified_acquisition(request.river_id, request.product_id)
+    acquisition, _, path = _verified_acquisition(request.river_id, request.product_id)
+    if path is None or acquisition.artifact_availability != "local_file_available":
+        raise FileNotFoundError(
+            f"The raw NISAR HDF5 file for {request.product_id} is not included in the production bundle."
+        )
     return _create_job("sar_processing", request)
 
 
@@ -1123,6 +1188,10 @@ def _execute(job_id: str) -> None:
                 str(request["river_id"]),
                 str(request["product_id"]),
             )
+            if path is None or acquisition.artifact_availability != "local_file_available":
+                raise FileNotFoundError(
+                    f"The raw NISAR HDF5 file for {acquisition.product_id} is not available."
+                )
             sar_adapter = _adapter_for("sar_processing")
             if sar_adapter is None or not callable(getattr(sar_adapter, "process", None)):
                 raise RuntimeError("The registered SAR adapter does not implement process().")
@@ -1212,7 +1281,14 @@ def retry_job(job_id: str) -> IntegrationJob:
     request_model: BaseModel
     if previous.job_type == "sar_processing":
         request_model = ProcessingJobCreate.model_validate(previous.request)
-        _verified_acquisition(request_model.river_id, request_model.product_id)
+        acquisition, _, path = _verified_acquisition(
+            request_model.river_id,
+            request_model.product_id,
+        )
+        if path is None or acquisition.artifact_availability != "local_file_available":
+            raise FileNotFoundError(
+                f"The raw NISAR HDF5 file for {request_model.product_id} is not included in the production bundle."
+            )
     else:
         request_model = GISJobCreate.model_validate(previous.request)
         for output_id in request_model.input_output_ids:

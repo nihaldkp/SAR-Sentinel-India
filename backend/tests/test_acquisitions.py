@@ -1630,9 +1630,14 @@ def test_catalog_status_recovers_hdf5_product_missing_from_sqlite(
     assert tungabhadra.nisar_status == "metadata_found"
     assert tungabhadra.nisar_product_id == product_id
     assert "Recovered 1 locally stored NISAR GCOV product(s)" in tungabhadra.nisar_message
-    assert len(tungabhadra.nisar_products) == 1
-    assert tungabhadra.nisar_products[0].product_id == product_id
-    assert tungabhadra.nisar_products[0].download_status == "downloaded"
+    products = {product.product_id: product for product in tungabhadra.nisar_products}
+    assert len(products) == 2
+    assert products[product_id].download_status == "downloaded"
+    assert products[product_id].artifact_availability == "local_file_available"
+    packaged_id = next(
+        product_id for product_id in products if "_A_010_" in product_id
+    )
+    assert products[packaged_id].artifact_availability == "metadata_only"
     assert tungabhadra.nisar_products[0].polarization == ["HH", "HV"]
     assert tungabhadra.nisar_products[0].processing_status == "not_attempted"
 

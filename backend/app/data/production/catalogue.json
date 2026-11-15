@@ -1,0 +1,294 @@
+{
+  "schema_version": 1,
+  "rivers": [
+    {
+      "river_id": "kaveri",
+      "nisar_status": "no_data",
+      "last_checked_at": "2026-11-09T08:27:55.651903+00:00",
+      "nisar_product_id": null,
+      "nisar_acquisition_start": null,
+      "message": "No NISAR GCOV product was found for this river in the last 45 days."
+    },
+    {
+      "river_id": "tungabhadra",
+      "nisar_status": "metadata_found",
+      "last_checked_at": "2026-11-09T08:28:11.470057+00:00",
+      "nisar_product_id": "NISAR_L2_UR_GCOV_035_012_A_010_4005_DHDH_A_20261106T002554_20261106T002628_P05036_F_F_J_001",
+      "nisar_acquisition_start": "2026-11-06T00:25:54+00:00",
+      "message": "This read-only demo snapshot contains two locally verified NISAR product records; the raw HDF5 files are not hosted."
+    }
+  ],
+  "records": [
+    {
+      "river_id": "tungabhadra",
+      "processing_status": "unvalidated_candidate",
+      "source_availability": "downloaded_verified",
+      "product": {
+        "product_id": "NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001",
+        "platform": "NISAR",
+        "acquisition_start": "2026-11-06T00:25:20+00:00",
+        "acquisition_end": "2026-11-06T00:25:55+00:00",
+        "product_level": "GCOV",
+        "processing_type": "L2",
+        "product_type": "GCOV",
+        "polarization": [
+          "HH",
+          "HV"
+        ],
+        "size_bytes": 6811549696,
+        "metadata_source": "ASF DAAC catalog record and locally verified project metadata",
+        "availability": "metadata_only",
+        "download_status": "downloaded",
+        "artifact_availability": "metadata_only",
+        "source_url": null,
+        "source_url_reference": null,
+        "local_path": null,
+        "acquisition_identifier": "NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001",
+        "hdf5_groups": [
+          "science"
+        ],
+        "sha256": "681af3bb7f67c64938e48c5d923a32ebe0b8541e596f61e89778424de60436ac",
+        "provider_checksum_algorithm": null,
+        "provider_checksum": null,
+        "integrity_status": "sha256_fingerprint_only",
+        "structure_verification_status": "verified",
+        "provider_authenticity_status": "not_verified",
+        "scientific_validation_status": "not_performed",
+        "download_timestamp": null,
+        "message": "Production demo includes metadata and, for A_009 only, a capped display GeoJSON; the raw NISAR HDF5 file is not hosted.",
+        "authentication_status": "unknown",
+        "authentication_checked_at": null,
+        "processing_status": "processed",
+        "processing_message": null,
+        "processing_result": {
+          "river_id": "tungabhadra",
+          "product_id": "NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001",
+          "status": "unvalidated_candidate",
+          "processor_version": "nisar-gcov-candidate-1",
+          "algorithm": "Convert linear frequency-A HHHH and HVHV power to 10*log10(max(power, 1e-6)) dB; estimate independent Otsu thresholds from 900-bin histograms spanning -60 to +30 dB; classify the combined candidate where HH_dB <= HH_threshold AND HV_dB <= HV_threshold.",
+          "frequency": "frequencyA",
+          "dataset_paths": {
+            "hh": "science/LSAR/GCOV/grids/frequencyA/HHHH",
+            "hv": "science/LSAR/GCOV/grids/frequencyA/HVHV",
+            "validity_mask": "science/LSAR/GCOV/grids/frequencyA/mask",
+            "x_coordinates": "science/LSAR/GCOV/grids/frequencyA/xCoordinates",
+            "y_coordinates": "science/LSAR/GCOV/grids/frequencyA/yCoordinates",
+            "projection": "science/LSAR/GCOV/grids/frequencyA/projection"
+          },
+          "acquisition_start": "2026-11-06T00:25:20+00:00",
+          "polarization": [
+            "HH",
+            "HV"
+          ],
+          "input_crs": "EPSG:32643",
+          "pixel_size_m": 10.0,
+          "reference_centerline_coverage_percent": 93.74801647467527,
+          "reference_centerline_length_km": 569.6081181289768,
+          "covered_centerline_length_km": 533.9963124246409,
+          "corridor_half_width_m": 1500.0,
+          "corridor_pixel_count": 15356387,
+          "valid_pixel_count": 12910080,
+          "valid_data_fraction": 0.8406977500632148,
+          "water_pixel_count": 3885882,
+          "candidate_water_area_m2": 388588200.0,
+          "candidate_water_area_lower_m2": 327527200.0,
+          "candidate_water_area_upper_m2": 459928900.0,
+          "hh_threshold_db": -11.749999999999996,
+          "hv_threshold_db": -19.049999999999997,
+          "threshold_sensitivity_db": 1.0,
+          "mask_width": 25660,
+          "mask_height": 21962,
+          "mask_url": null,
+          "measurements_url": null,
+          "polygons_url": "/api/acquisitions/nisar/NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001/processing/polygons?river_id=tungabhadra",
+          "metadata_url": "/api/acquisitions/nisar/NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001/processing?river_id=tungabhadra",
+          "polygon_feature_count": 5000,
+          "vectorization_truncated": true,
+          "processing_completed_at": "2026-11-09T08:01:08.712617+00:00",
+          "caveats": [
+            "This is an unvalidated candidate open-water classification, not a verified river boundary.",
+            "The dual-polarization Otsu thresholds are data-adaptive exploratory thresholds; no ground-truth labels or accuracy assessment are available.",
+            "Low HH and HV backscatter can also occur over non-water surfaces, shadow, and other radar-dark targets; vegetation, incidence-angle, and terrain effects are not independently screened.",
+            "The analysis is limited to a 1,500 m corridor around the OpenStreetMap reference centerline and the portion of that corridor inside this product footprint.",
+            "Reported threshold sensitivity uses both polarization thresholds shifted by plus or minus 1 dB; it is not a statistical confidence interval.",
+            "Candidate water area is the sum of valid 10 m product-grid pixels classified by the stated rule; it is not river width, channel area, flood extent, erosion, deposition, or riverbank movement.",
+            "The output GeoTIFF preserves invalid and out-of-corridor pixels as NoData. Candidate GeoJSON omits polygons smaller than three pixels and may be truncated at 5,000 features; use the GeoTIFF for complete classified-pixel counts and area.",
+            "Production demo includes only the capped display GeoJSON; the complete candidate-mask GeoTIFF and raw HDF5 are not hosted."
+          ],
+          "acquisition_end": "2026-11-06T00:25:55+00:00",
+          "polarization_comparison": [
+            {
+              "classification": "HH-only",
+              "candidate_pixel_count": 4731657,
+              "candidate_area_m2": 473165700.0
+            },
+            {
+              "classification": "HV-only",
+              "candidate_pixel_count": 5849311,
+              "candidate_area_m2": 584931100.0
+            },
+            {
+              "classification": "HH+HV",
+              "candidate_pixel_count": 3885882,
+              "candidate_area_m2": 388588200.0
+            }
+          ],
+          "threshold_sensitivity": [
+            {
+              "offset_db": -2.0,
+              "candidate_pixel_count": 2715856,
+              "candidate_area_m2": 271585600.0
+            },
+            {
+              "offset_db": -1.0,
+              "candidate_pixel_count": 3275272,
+              "candidate_area_m2": 327527200.0
+            },
+            {
+              "offset_db": 0.0,
+              "candidate_pixel_count": 3885882,
+              "candidate_area_m2": 388588200.0
+            },
+            {
+              "offset_db": 1.0,
+              "candidate_pixel_count": 4599289,
+              "candidate_area_m2": 459928900.0
+            },
+            {
+              "offset_db": 2.0,
+              "candidate_pixel_count": 5453585,
+              "candidate_area_m2": 545358500.0
+            }
+          ],
+          "connected_component_summary": {
+            "connectivity": 8,
+            "component_count": 160502,
+            "isolated_pixel_component_count": 89437,
+            "components_up_to_four_pixels": 133213,
+            "pixels_in_components_up_to_four": 202003,
+            "largest_component_pixels": 1564211
+          },
+          "comparison_url": null,
+          "sensitivity_url": null,
+          "geojson_display_note": "Display-only GeoJSON is simplified, omits components smaller than three pixels, and is capped at 5,000 features. The candidate mask GeoTIFF retains the complete pixel classification with NoData. Production demo includes only this capped display GeoJSON; the complete candidate-mask GeoTIFF and raw HDF5 are not hosted.",
+          "optical_reference_url": null,
+          "optical_candidate_mask_url": null
+        }
+      },
+      "candidate_geojson": {
+        "relative_path": "tungabhadra/NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001/candidate-water.geojson",
+        "size_bytes": 2563770,
+        "sha256": "4a3c100a69098fbe3b95e8942a70b5b2d4c7cdbb6e89dbb98ca2393dc2d7b79b",
+        "crs": "EPSG:4326",
+        "feature_count": 5000,
+        "vectorization_truncated": true
+      }
+    },
+    {
+      "river_id": "tungabhadra",
+      "processing_status": "no_data",
+      "source_availability": "downloaded_verified",
+      "product": {
+        "product_id": "NISAR_L2_UR_GCOV_035_012_A_010_4005_DHDH_A_20261106T002554_20261106T002628_P05036_F_F_J_001",
+        "platform": "NISAR",
+        "acquisition_start": "2026-11-06T00:25:54+00:00",
+        "acquisition_end": "2026-11-06T00:26:28+00:00",
+        "product_level": "GCOV",
+        "processing_type": "L2",
+        "product_type": "GCOV",
+        "polarization": [
+          "HH",
+          "HV"
+        ],
+        "size_bytes": 6618611712,
+        "metadata_source": "ASF DAAC catalog record and locally verified project metadata",
+        "availability": "metadata_only",
+        "download_status": "downloaded",
+        "artifact_availability": "metadata_only",
+        "source_url": null,
+        "source_url_reference": null,
+        "local_path": null,
+        "acquisition_identifier": "NISAR_L2_UR_GCOV_035_012_A_010_4005_DHDH_A_20261106T002554_20261106T002628_P05036_F_F_J_001",
+        "hdf5_groups": [
+          "science"
+        ],
+        "sha256": "69c67d71be73a4f8a00bc9ac3c6d5800ad4c9fd9989cf75073455027f3bf8d5d",
+        "provider_checksum_algorithm": null,
+        "provider_checksum": null,
+        "integrity_status": "sha256_fingerprint_only",
+        "structure_verification_status": "verified",
+        "provider_authenticity_status": "not_verified",
+        "scientific_validation_status": "not_performed",
+        "download_timestamp": null,
+        "message": "Production demo includes metadata and, for A_009 only, a capped display GeoJSON; the raw NISAR HDF5 file is not hosted.",
+        "authentication_status": "unknown",
+        "authentication_checked_at": null,
+        "processing_status": "no_data",
+        "processing_message": null,
+        "processing_result": {
+          "river_id": "tungabhadra",
+          "product_id": "NISAR_L2_UR_GCOV_035_012_A_010_4005_DHDH_A_20261106T002554_20261106T002628_P05036_F_F_J_001",
+          "status": "no_valid_corridor_data",
+          "processor_version": "nisar-gcov-candidate-1",
+          "algorithm": "No classification performed: no paired, fully focused frequency-A HH/HV pixels were available inside the mapped river corridor.",
+          "frequency": "frequencyA",
+          "dataset_paths": {
+            "hh": "science/LSAR/GCOV/grids/frequencyA/HHHH",
+            "hv": "science/LSAR/GCOV/grids/frequencyA/HVHV",
+            "validity_mask": "science/LSAR/GCOV/grids/frequencyA/mask",
+            "x_coordinates": "science/LSAR/GCOV/grids/frequencyA/xCoordinates",
+            "y_coordinates": "science/LSAR/GCOV/grids/frequencyA/yCoordinates",
+            "projection": "science/LSAR/GCOV/grids/frequencyA/projection"
+          },
+          "acquisition_start": "2026-11-06T00:25:54+00:00",
+          "polarization": [
+            "HH",
+            "HV"
+          ],
+          "input_crs": "EPSG:32643",
+          "pixel_size_m": 10.0,
+          "reference_centerline_coverage_percent": 33.25855039714682,
+          "reference_centerline_length_km": 569.6081181289768,
+          "covered_centerline_length_km": 189.44340303416536,
+          "corridor_half_width_m": 1500.0,
+          "corridor_pixel_count": 5213075,
+          "valid_pixel_count": 0,
+          "valid_data_fraction": 0.0,
+          "water_pixel_count": null,
+          "candidate_water_area_m2": null,
+          "candidate_water_area_lower_m2": null,
+          "candidate_water_area_upper_m2": null,
+          "hh_threshold_db": null,
+          "hv_threshold_db": null,
+          "threshold_sensitivity_db": 1.0,
+          "mask_width": 0,
+          "mask_height": 0,
+          "mask_url": null,
+          "measurements_url": null,
+          "polygons_url": null,
+          "metadata_url": "/api/acquisitions/nisar/NISAR_L2_UR_GCOV_035_012_A_010_4005_DHDH_A_20261106T002554_20261106T002628_P05036_F_F_J_001/processing?river_id=tungabhadra",
+          "polygon_feature_count": 0,
+          "vectorization_truncated": false,
+          "processing_completed_at": "2026-11-09T07:17:16.673628+00:00",
+          "caveats": [
+            "This is an unvalidated candidate open-water classification, not a verified river boundary.",
+            "The dual-polarization Otsu thresholds are data-adaptive exploratory thresholds; no ground-truth labels or accuracy assessment are available.",
+            "Low HH and HV backscatter can also occur over non-water surfaces, shadow, and other radar-dark targets; vegetation, incidence-angle, and terrain effects are not independently screened.",
+            "The analysis is limited to a 1,500 m corridor around the OpenStreetMap reference centerline and the portion of that corridor inside this product footprint.",
+            "Reported threshold sensitivity uses both polarization thresholds shifted by plus or minus 1 dB; it is not a statistical confidence interval.",
+            "Candidate water area is the sum of valid 10 m product-grid pixels classified by the stated rule; it is not river width, channel area, flood extent, erosion, deposition, or riverbank movement.",
+            "The output GeoTIFF preserves invalid and out-of-corridor pixels as NoData. Candidate GeoJSON omits polygons smaller than three pixels and may be truncated at 5,000 features; use the GeoTIFF for complete classified-pixel counts and area.",
+            "No water mask or area was generated because the product validity mask and HH/HV samples contain no valid paired observations in the reference corridor.",
+            "The raw HDF5 file is not included in the production demo."
+          ],
+          "acquisition_end": "2026-11-06T00:26:28+00:00",
+          "comparison_url": null,
+          "sensitivity_url": null,
+          "optical_reference_url": null,
+          "optical_candidate_mask_url": null
+        }
+      },
+      "candidate_geojson": null
+    }
+  ]
+}

@@ -33,6 +33,16 @@ excludes ignored satellite datasets and does not provide persistent backend
 storage. The separate [Cloudflare Pages and Oracle guide](./deploy/README.md)
 is an alternative and has not been provisioned or verified.
 
+The Render demonstration backend includes a small read-only NISAR snapshot
+from the project’s local catalog. It records Tungabhadra A_009
+(`unvalidated_candidate`) and A_010 (`no_data`); Kaveri has a dated no-data
+scan record but no NISAR product record. See the [packaged catalogue](./backend/app/data/production/catalogue.json).
+Only A_009’s capped 5,000-feature, EPSG:4326 display GeoJSON is bundled. Raw
+HDF5 files, complete candidate rasters, and the local SQLite database are not
+hosted or persisted. The SHA-256 values are local fingerprints, not provider
+checksums; structure verification is historical and scientific validation
+has not been performed. Automatic acquisition remains disabled.
+
 In PowerShell:
 
 ```powershell
@@ -86,6 +96,7 @@ Initial endpoints:
 - `POST /api/gis/layers/import` and `DELETE /api/gis/layers/{layer_id}` for temporary GeoJSON layers
 - `GET /api/satellite/search?river_id=kaveri&mission=NISAR&start_date=2026-10-01&end_date=2026-10-31&product_type=GCOV`
 - `GET /api/acquisitions`
+- `GET /api/integration/acquisitions?river_id=tungabhadra` — includes packaged metadata when local SQLite or raw files are absent; inspect `artifact_availability` before assuming a product file is hosted.
 - `POST /api/acquisitions/nisar/metadata` — registers metadata for the explicitly supplied ASF product ID only; it does not download the HDF5 product or start an acquisition job.
 - `POST /api/acquisitions/refresh`
 - `POST /api/acquisitions/nisar/{product_id}/process?river_id=tungabhadra`

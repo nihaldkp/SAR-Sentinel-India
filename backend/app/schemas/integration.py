@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.acquisitions import NisarProcessingResult
+
 IntegrationJobType = Literal["sar_processing", "gis_analysis"]
 IntegrationJobStatus = Literal["queued", "running", "blocked", "completed", "failed"]
 IntegrationOutputType = Literal["raster", "vector", "metadata"]
@@ -26,6 +28,9 @@ class VerifiedAcquisition(BaseModel):
     file_reference: str
     file_size_bytes: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    artifact_availability: Literal["local_file_available", "metadata_only"] = "local_file_available"
+    processing_status: Literal["unvalidated_candidate", "no_data"] | None = None
+    processing_result: NisarProcessingResult | None = None
     integrity_status: Literal[
         "provider_checksum_verified",
         "sha256_fingerprint_only",
@@ -77,6 +82,7 @@ class AcquisitionVerification(BaseModel):
     provider_checksum_algorithm: Literal["sha256", "md5"] | None = None
     provider_checksum: str | None = None
     scientific_validation_status: Literal["not_performed"]
+    artifact_availability: Literal["local_file_available", "metadata_only"] = "local_file_available"
     verified_at: datetime | None = None
     verification_scope: Literal["recorded_download_verification"]
 

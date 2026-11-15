@@ -449,8 +449,17 @@ export default function AutomaticAcquisitionPanel({
                 <div className="nisar-product" key={product.product_id}>
                   <strong>{product.product_level} · {product.polarization?.join(", ") ?? "polarization not reported by ASF"}</strong>
                   <span>{product.product_id} · {formatDate(product.acquisition_start)} · {formatBytes(product.size_bytes)}</span>
-                  <span>Availability: {product.availability.replaceAll("_", " ")} · download: {product.download_status.replaceAll("_", " ")}</span>
-                  {product.hdf5_groups.length > 0 && <span>HDF5 groups: {product.hdf5_groups.join(", ")}</span>}
+                  {product.artifact_availability === "metadata_only" ? (
+                    <span>Production bundle: metadata only; raw HDF5 is not hosted. Recorded source download status: {product.download_status.replaceAll("_", " ")}.</span>
+                  ) : (
+                    <span>Availability: {product.availability.replaceAll("_", " ")} · download: {product.download_status.replaceAll("_", " ")}</span>
+                  )}
+                  {product.hdf5_groups.length > 0 && (
+                    <span>
+                      {product.artifact_availability === "metadata_only" ? "HDF5 groups recorded from source verification: " : "HDF5 groups: "}
+                      {product.hdf5_groups.join(", ")}
+                    </span>
+                  )}
                   {product.message && <small>{product.message}</small>}
                   {product.local_path && (
                     <a href={`${API_BASE_URL}/api/acquisitions/nisar/${encodeURIComponent(product.product_id)}/download`}>

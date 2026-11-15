@@ -6,6 +6,39 @@
 
 **Status:** Snapshot of the implemented application and verified data, not a claim of scientific validation or project completion.
 
+## 2026-11-15 — Render production catalogue diagnosis
+
+The empty Render acquisition list was caused by the production service's
+dependence on the ignored local SQLite catalogue and local NISAR HDF5 files.
+The integration list intentionally requires a locally present, size/hash
+consistent and structure-verified file; Render's empty ephemeral catalogue
+and absent product files therefore yielded zero records.
+
+Added a bounded, versioned static fallback sourced only from the existing
+Tungabhadra `river_scans.nisar_products_json` records and their processing
+metadata. It contains A_009 and A_010, not raw HDF5. The A_009 capped display
+GeoJSON is 2,563,770 bytes, EPSG:4326, and explicitly truncated at 5,000
+features; no complete mask GeoTIFF is bundled. Kaveri's source scan says
+`no_data` as of 2026-11-09 and contains no NISAR product record. The snapshot
+does not imply a current live search.
+
+The APIs merge the packaged records only where a local verified product is
+absent. Metadata-only availability is explicit; local fingerprint SHA-256 is
+not represented as a provider checksum, provider authenticity remains
+unverified, structure verification is historical, and scientific validation
+remains `not_performed`. Missing or corrupt manifests/artifacts return a
+service-unavailable error rather than a success-shaped empty catalog.
+For bundled records, processing metadata and the capped display GeoJSON are
+available, but raster outputs are not; raw-file processing is rejected
+without the raw HDF5. Public read-only and
+automatic-acquisition-disabled Render settings are unchanged.
+
+Verification: backend **278 passed, 3 skipped**; Python compile check passed;
+frontend production build passed; targeted metadata-only NISAR Playwright
+test passed. These are local checks only: no Render deployment or live
+production API verification was performed, and no scientific result was
+validated.
+
 ## 2026-11-15 — presentation-readiness and cached-download audit
 
 | Module | Current state | Evidence and limits |

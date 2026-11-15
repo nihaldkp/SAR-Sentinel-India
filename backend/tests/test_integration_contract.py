@@ -13,7 +13,7 @@ from rasterio.transform import from_origin
 
 from app.main import app
 from app.schemas.integration import OutputRegistrationRequest
-from app.services import acquisitions, integration
+from app.services import acquisitions, integration, production_catalogue
 
 client = TestClient(app)
 PRODUCT_ID = (
@@ -202,12 +202,15 @@ def test_verified_acquisitions_and_verification_api(
 ) -> None:
     page = client.get("/api/integration/acquisitions")
     assert page.status_code == 200
-    assert page.json()["total"] == 1
-    acquisition = page.json()["items"][0]
+    assert page.json()["total"] == 2
+    acquisition = next(
+        item for item in page.json()["items"] if item["product_id"] == PRODUCT_ID
+    )
     assert acquisition["product_id"] == PRODUCT_ID
     assert acquisition["structure_verification_status"] == "verified"
     assert acquisition["provider_authenticity_status"] == "not_verified"
     assert acquisition["scientific_validation_status"] == "not_performed"
+    assert acquisition["artifact_availability"] == "local_file_available"
     assert not Path(acquisition["file_reference"]).is_absolute()
 
     detail = client.get(f"/api/integration/acquisitions/tungabhadra/{PRODUCT_ID}")
@@ -217,6 +220,110 @@ def test_verified_acquisitions_and_verification_api(
     assert detail.status_code == verification.status_code == 200
     assert verification.json()["verification_scope"] == "recorded_download_verification"
     assert verification.json()["sha256"] == configured_catalog["record"]["sha256"]
+
+
+def test_packaged_acquisitions_fallback_and_river_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(integration, "_product_records", lambda river_id=None: [])
+
+    all_records = client.get("/api/integration/acquisitions")
+    tungabhadra = client.get("/api/integration/acquisitions?river_id=tungabhadra")
+    kaveri = client.get("/api/integration/acquisitions?river_id=kaveri")
+
+    assert all_records.status_code == tungabhadra.status_code == kaveri.status_code == 200
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+    assert health.json()["data_mode"] == "demonstration"
+    assert all_records.json()["total"] == 2
+    assert tungabhadra.json()["total"] == 2
+    assert kaveri.json()["total"] == 0
+    by_id = {item["product_id"]: item for item in all_records.json()["items"]}
+    a009 = next(item for product_id, item in by_id.items() if "_A_009_" in product_id)
+    a010 = next(item for product_id, item in by_id.items() if "_A_010_" in product_id)
+    assert a009["processing_status"] == "unvalidated_candidate"
+    assert a009["processing_result"]["status"] == "unvalidated_candidate"
+    assert a009["artifact_availability"] == "metadata_only"
+    assert a009["integrity_status"] == "sha256_fingerprint_only"
+    assert a009["provider_authenticity_status"] == "not_verified"
+    assert a009["scientific_validation_status"] == "not_performed"
+    assert a009["file_reference"].startswith("metadata-only://")
+    assert a010["processing_status"] == "no_data"
+    assert a010["processing_result"]["valid_pixel_count"] == 0
+    assert a010["processing_result"]["candidate_water_area_m2"] is None
+
+    detail = client.get(f"/api/integration/acquisitions/tungabhadra/{a009['product_id']}")
+    verification = client.get(
+        f"/api/integration/acquisitions/tungabhadra/{a009['product_id']}/verification"
+    )
+    assert detail.status_code == verification.status_code == 200
+    assert detail.json()["sha256"] == a009["sha256"]
+    assert verification.json()["artifact_availability"] == "metadata_only"
+    assert verification.json()["verification_scope"] == "recorded_download_verification"
+
+    polygons = client.get(a009["processing_result"]["polygons_url"])
+    assert polygons.status_code == 200
+    assert len(polygons.json()["features"]) == 5000
+
+
+def test_empty_runtime_catalogue_serves_packaged_acquisitions_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(acquisitions, "CATALOG_PATH", tmp_path / "empty-catalogue.sqlite3")
+    monkeypatch.setattr(acquisitions, "ACQUISITION_ROOT", tmp_path / "empty-acquisitions")
+    monkeypatch.setattr(acquisitions, "automatic_acquisition_enabled", lambda: False)
+
+    response = client.get("/api/acquisitions")
+
+    assert response.status_code == 200
+    result = response.json()
+    by_river = {river["river_id"]: river for river in result["rivers"]}
+    assert by_river["kaveri"]["nisar_status"] == "no_data"
+    assert by_river["kaveri"]["nisar_products"] == []
+    assert by_river["tungabhadra"]["nisar_status"] == "metadata_found"
+    assert len(by_river["tungabhadra"]["nisar_products"]) == 2
+    assert all(
+        product["artifact_availability"] == "metadata_only"
+        and product["local_path"] is None
+        for product in by_river["tungabhadra"]["nisar_products"]
+    )
+    assert result["nisar_connection_status"]["cached_product_count"] == 0
+    assert result["nisar_connection_status"]["metadata_only_product_count"] == 2
+
+    a009 = next(
+        product for product in by_river["tungabhadra"]["nisar_products"]
+        if "_A_009_" in product["product_id"]
+    )
+    processing = client.get(a009["processing_result"]["metadata_url"])
+    assert processing.status_code == 200
+    assert processing.json()["status"] == "unvalidated_candidate"
+
+    submission = client.post(
+        "/api/processing/jobs",
+        json=_processing_request(),
+    )
+    assert submission.status_code == 404
+    assert "raw NISAR HDF5" in submission.json()["detail"]
+
+
+def test_invalid_default_bundle_returns_service_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invalid_path = tmp_path / "invalid-catalogue.json"
+    invalid_path.write_text("{", encoding="utf-8")
+    monkeypatch.setattr(production_catalogue, "PRODUCTION_CATALOGUE_PATH", invalid_path)
+    monkeypatch.setattr(production_catalogue, "PRODUCTION_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(integration, "_product_records", lambda river_id=None: [])
+    production_catalogue._load_default_catalogue.cache_clear()
+    try:
+        response = client.get("/api/integration/acquisitions")
+        assert response.status_code == 503
+        assert "catalogue is invalid" in response.json()["detail"]
+    finally:
+        production_catalogue._load_default_catalogue.cache_clear()
 
 
 def test_integration_recovers_local_record_when_legacy_catalog_checksum_is_missing(

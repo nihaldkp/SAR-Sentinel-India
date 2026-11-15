@@ -6,6 +6,26 @@
 
 **Overall status:** Software delivery for the implemented, currently available workflows is verified. Scientific validation and several data-dependent analyses remain incomplete; this is not a claim of scientific completion.
 
+## 2026-11-15 — Render catalogue fallback addendum
+
+The Render demonstration backend now has a version-controlled read-only
+catalogue fallback for the records that previously existed only in local
+SQLite and product storage. The package preserves Tungabhadra A_009 as an
+`unvalidated_candidate` and A_010 as `no_data`; Kaveri is represented only
+by its dated no-data scan. It includes acquisition metadata, local
+SHA-256 fingerprints, provenance labels, processing summaries, and A_009's
+capped display-only GeoJSON. No raw HDF5 or full candidate raster is
+included, and no observation has been invented.
+
+Local APIs pass the empty-runtime-database fallback checks for health,
+`/api/acquisitions`, `/api/integration/acquisitions`, verification, processing
+metadata, and the bundled GeoJSON. Backend: **278 passed, 3 skipped**; Python
+compile check passed; frontend build passed; targeted Playwright: **1 passed**.
+The Vite build reports a 530.78 kB chunk above its 500 kB advisory. Ruff was
+not installed. No commit, push, Render redeploy, or live Render API check was
+performed. The existing Render config remains read-only with automatic
+acquisition disabled.
+
 ## 2026-11-15 — presentation audit addendum
 
 **Presentation status:** Ready for a cached-data demonstration with explicit

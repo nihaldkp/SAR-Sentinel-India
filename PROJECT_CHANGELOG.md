@@ -1,5 +1,25 @@
 # SAR Sentinel India — Project Changelog
 
+## 2026-11-15 — read-only Render NISAR catalogue bundle
+
+- Added a validated static catalogue sourced from existing Tungabhadra A_009
+  and A_010 metadata, plus Kaveri's timestamped no-data scan. No Kaveri
+  product or observation was fabricated.
+- Bundled processing metadata and A_009's existing 2,563,770-byte capped
+  display GeoJSON; SHA-256 integrity is checked before serving. Raw HDF5,
+  raster outputs, local absolute paths, and source URLs are not packaged.
+- `/api/acquisitions` and `/api/integration/acquisitions` now use the bundle
+  when the runtime database or local products are missing. Local verified
+  products remain authoritative, and metadata-only records cannot start
+  processing jobs.
+- Exposed metadata-only availability and retained `unvalidated_candidate`,
+  `no_data`, fingerprint-only integrity, provider-authenticity, and
+  scientific-validation labels. Render stays read-only with automatic
+  acquisition disabled.
+- Verification: backend 278 passed/3 skipped; Python compile check passed;
+  frontend build passed; targeted metadata-only NISAR browser test 1 passed.
+  No Render deployment, commit, or push was performed.
+
 ## 2026-11-15 — presentation and Agriculture cached-output audit
 
 - Verified all 15 available cached NDVI/EVI/NDMI download responses from five

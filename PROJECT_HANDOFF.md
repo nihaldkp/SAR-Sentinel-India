@@ -4,6 +4,45 @@
 
 **Workspace:** `D:\SAR-Sentinel-India`
 
+## 2026-11-15 — Render NISAR catalogue handoff
+
+The backend now contains a small, read-only production bundle at
+`backend/app/data/production/catalogue.json` plus A_009's capped display
+GeoJSON. It is generated from existing local `river_scans` metadata and
+processing sidecars; the full SQLite database, raw HDF5 products, and complete
+candidate rasters remain excluded. Tungabhadra A_009 is still an
+`unvalidated_candidate`; A_010 is `no_data`. Kaveri has a timestamped
+no-product scan record only.
+
+When runtime SQLite or local raw files are absent, `/api/acquisitions`
+includes the bundled NISAR metadata and `/api/integration/acquisitions`
+returns both product records. Each response marks `artifact_availability` as
+`metadata_only`; source hashes are local fingerprints, provider authenticity
+is unverified, and scientific validation was not performed. The A_009
+GeoJSON endpoint verifies its packaged SHA-256 and serves only the
+EPSG:4326, 5,000-feature display output. No download link is exposed for raw
+HDF5 or missing raster outputs. Metadata-only records cannot be submitted
+for SAR processing.
+
+Validation completed locally: backend **278 passed, 3 skipped**, Python
+compile check passed, frontend build passed (530.78 kB chunk advisory), and
+the targeted Playwright test passed. TestClient covered health, acquisition
+status/listing, detail, verification, processing metadata, and the candidate
+GeoJSON endpoint. Ruff was unavailable. No commit, push, or Render deployment
+was performed. Render's existing `render.yaml` already sets
+`SAR_PUBLIC_READ_ONLY=true` and `SAR_AUTO_ACQUISITION_ENABLED=false`; pushing
+a reviewed commit to `integrate/nisar-gcov` will trigger its configured
+automatic redeploy.
+
+To publish only after reviewing the diff, stage the explicit changed files
+(never the local SQLite database or raw data), then commit and push:
+
+```powershell
+git add -- README.md PROJECT_PROGRESS.md PROJECT_CHANGELOG.md PROJECT_HANDOFF.md PROJECT-AUDIT.md FINAL_PROJECT_COMPLETION_REPORT.md backend/app/api/routes.py backend/app/schemas/acquisitions.py backend/app/schemas/integration.py backend/app/services/acquisitions.py backend/app/services/integration.py backend/app/services/production_catalogue.py backend/app/data/production/catalogue.json backend/app/data/production/tungabhadra/NISAR_L2_UR_GCOV_035_012_A_009_4005_DHDH_A_20261106T002520_20261106T002555_P05036_F_F_J_001/candidate-water.geojson backend/tests/test_acquisitions.py backend/tests/test_integration_contract.py backend/tests/test_production_catalogue.py frontend/src/components/AutomaticAcquisitionPanel.jsx frontend/tests/e2e/rivers.spec.js
+git commit -m "Add read-only production NISAR catalogue" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+git push origin integrate/nisar-gcov
+```
+
 ## 2026-11-15 — cached-data presentation handoff
 
 Presentation status is **cached-data demo ready with disclosed limitations**.

@@ -92,6 +92,7 @@ from app.services import analysis
 from app.services import acquisitions
 from app.services import acquisition_jobs
 from app.services import integration
+from app.services.production_catalogue import ProductionCatalogueError
 from app.services import reference_lifecycle
 from app.services import ai_analysis
 from app.services import nwic_river_explorer
@@ -673,7 +674,10 @@ async def search_satellite(
 
 @router.get("/acquisitions", response_model=AcquisitionStatus, tags=["satellite"])
 def get_acquisitions() -> AcquisitionStatus:
-    return acquisitions.get_catalog_status()
+    try:
+        return acquisitions.get_catalog_status()
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.post("/reports/workspace", tags=["reports"])
@@ -877,6 +881,8 @@ def list_verified_nisar_acquisitions(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.get(
@@ -892,6 +898,8 @@ def get_verified_nisar_acquisition(
         return integration.get_verified_acquisition(river_id, product_id)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -911,6 +919,8 @@ def get_nisar_acquisition_verification(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.post(
@@ -1247,6 +1257,8 @@ def get_nisar_processing_result(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.post(
@@ -1481,6 +1493,8 @@ def download_nisar_candidate_polygons(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    except ProductionCatalogueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @router.get("/acquisitions/nisar/{product_id}/processing/comparison", tags=["satellite"])

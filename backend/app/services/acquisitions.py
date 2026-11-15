@@ -2786,19 +2786,61 @@ def _status_from_connection(connection: sqlite3.Connection) -> AcquisitionStatus
             )
         )
     checked_times = [
-        row["last_checked_at"]
+        _timestamp(row["last_checked_at"])
         for row in scans.values()
         if row["last_checked_at"]
     ]
-    latest_check = max(checked_times) if checked_times else None
+    latest_database_check = max(
+        (value for value in checked_times if value is not None),
+        default=None,
+    )
+    from app.services.production_catalogue import load_production_catalogue
+
+    catalogue = load_production_catalogue()
+    packaged_rivers = {river.river_id: river for river in catalogue.rivers}
+    packaged_products: dict[str, list[NisarProduct]] = {}
+    for record in catalogue.records:
+        packaged_products.setdefault(record.river_id, []).append(record.product)
+    merged_river_statuses: list[RiverAcquisitionStatus] = []
+    for river_status in river_statuses:
+        packaged_status = packaged_rivers.get(river_status.river_id)
+        products_by_id = {product.product_id: product for product in river_status.nisar_products}
+        for product in packaged_products.get(river_status.river_id, []):
+            products_by_id.setdefault(product.product_id, product)
+        updates: dict[str, Any] = {
+            "nisar_products": list(products_by_id.values()),
+        }
+        if (
+            packaged_status is not None
+            and (
+                river_status.last_checked_at is None
+                or packaged_status.last_checked_at > river_status.last_checked_at
+            )
+        ):
+            updates.update(
+                {
+                    "nisar_status": packaged_status.nisar_status,
+                    "nisar_product_id": packaged_status.nisar_product_id,
+                    "nisar_acquisition_start": packaged_status.nisar_acquisition_start,
+                    "nisar_message": packaged_status.message,
+                    "last_checked_at": packaged_status.last_checked_at,
+                }
+            )
+        merged_river_statuses.append(river_status.model_copy(update=updates))
+    checked_times = [
+        status.last_checked_at
+        for status in merged_river_statuses
+        if status.last_checked_at is not None
+    ]
+    latest_check = max(checked_times, default=latest_database_check)
     return AcquisitionStatus(
         enabled=automatic_acquisition_enabled(),
         polling_interval_seconds=POLL_INTERVAL_SECONDS,
-        last_checked_at=_timestamp(latest_check),
+        last_checked_at=latest_check,
         source="Microsoft Planetary Computer Sentinel-1 RTC",
         source_url=f"{STAC_URL}/collections/sentinel-1-rtc",
         license="CC-BY-4.0",
-        rivers=river_statuses,
+        rivers=merged_river_statuses,
     )
 
 
@@ -2890,7 +2932,15 @@ def _save_nisar_product_record(
 
 
 def nisar_processing_result(river_id: str, product_id: str) -> dict[str, Any]:
-    product, product_path = _nisar_product_record(river_id, product_id)
+    try:
+        product, product_path = _nisar_product_record(river_id, product_id)
+    except FileNotFoundError:
+        from app.services.production_catalogue import get_record
+
+        packaged = get_record(river_id, product_id)
+        if packaged is None or packaged.product.processing_result is None:
+            raise
+        return packaged.product.processing_result.model_dump(mode="json")
     result = product.get("processing_result")
     if not result:
         raise FileNotFoundError(f"No NISAR processing result found for {river_id}/{product_id}.")
@@ -3418,14 +3468,23 @@ def nisar_processing_output_path(
     }
     if output_name not in allowed_outputs:
         raise ValueError("Unsupported NISAR processing output.")
-    _, product_path = _nisar_product_record(river_id, product_id)
-    processing_directory = (product_path.parent / "nisar-processing").resolve()
-    if not processing_directory.is_relative_to(product_path.parent.resolve()):
-        raise ValueError("NISAR processing output path is outside the product directory.")
-    result_path = (processing_directory / allowed_outputs[output_name]).resolve()
-    if not result_path.is_relative_to(processing_directory) or not result_path.is_file():
-        raise FileNotFoundError(f"NISAR processing output {output_name} is not available.")
-    return result_path
+    try:
+        _, product_path = _nisar_product_record(river_id, product_id)
+        processing_directory = (product_path.parent / "nisar-processing").resolve()
+        if not processing_directory.is_relative_to(product_path.parent.resolve()):
+            raise ValueError("NISAR processing output path is outside the product directory.")
+        result_path = (processing_directory / allowed_outputs[output_name]).resolve()
+        if not result_path.is_relative_to(processing_directory):
+            raise ValueError("NISAR processing output path is outside the product directory.")
+        if result_path.is_file():
+            return result_path
+    except FileNotFoundError:
+        pass
+    if output_name == "polygons":
+        from app.services.production_catalogue import get_candidate_geojson_path
+
+        return get_candidate_geojson_path(river_id, product_id)
+    raise FileNotFoundError(f"NISAR processing output {output_name} is not available.")
 
 
 async def refresh_catalog_async() -> AcquisitionStatus:

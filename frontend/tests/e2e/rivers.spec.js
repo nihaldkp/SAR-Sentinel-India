@@ -371,6 +371,94 @@ test("river selection keeps the map legend aligned with visible centerlines", as
   await expect(legend.getByText("Kaveri River · OSM")).toHaveCount(0);
 });
 
+test("metadata-only NISAR bundle discloses unavailable raw files", async ({ page }) => {
+  const productId = "NISAR_L2_UR_GCOV_FIXTURE_A_009";
+  const processingUrl = `/api/acquisitions/nisar/${productId}/processing?river_id=tungabhadra`;
+  const polygonsUrl = `/api/acquisitions/nisar/${productId}/processing/polygons?river_id=tungabhadra`;
+  const product = {
+    product_id: productId,
+    product_level: "GCOV",
+    product_type: "GCOV",
+    platform: "NISAR",
+    acquisition_start: "2026-11-06T00:25:20Z",
+    acquisition_end: "2026-11-06T00:25:55Z",
+    polarization: ["HH", "HV"],
+    size_bytes: 6811549696,
+    availability: "metadata_only",
+    download_status: "downloaded",
+    artifact_availability: "metadata_only",
+    local_path: null,
+    hdf5_groups: [],
+    sha256: "681af3bb7f67c64938e48c5d923a32ebe0b8541e596f61e89778424de60436ac",
+    integrity_status: "sha256_fingerprint_only",
+    structure_verification_status: "verified",
+    provider_authenticity_status: "not_verified",
+    scientific_validation_status: "not_performed",
+    processing_status: "processed",
+    message: "Production demo includes metadata; the raw NISAR HDF5 file is not hosted.",
+    processing_result: {
+      status: "unvalidated_candidate",
+      input_crs: "EPSG:32643",
+      pixel_size_m: 10,
+      valid_pixel_count: 12910080,
+      valid_data_fraction: 0.84069775,
+      candidate_water_area_m2: 388588200,
+      candidate_water_area_lower_m2: 327527200,
+      candidate_water_area_upper_m2: 459928900,
+      covered_centerline_length_km: 533.99,
+      reference_centerline_length_km: 569.61,
+      reference_centerline_coverage_percent: 93.75,
+      polarization_comparison: [],
+      threshold_sensitivity: [],
+      connected_component_summary: null,
+      optical_reference_url: null,
+      optical_candidate_mask_url: null,
+      polygons_url: polygonsUrl,
+      metadata_url: processingUrl,
+      geojson_display_note: "Only the capped display GeoJSON is bundled; the full raster is not hosted.",
+      mask_url: null,
+      measurements_url: null,
+      comparison_url: null,
+      sensitivity_url: null,
+    },
+  };
+  await page.route("**/api/acquisitions", (route) => route.fulfill({ json: {
+    enabled: false,
+    polling_interval_seconds: 21600,
+    source: "Microsoft Planetary Computer Sentinel-1 RTC",
+    source_url: "https://planetarycomputer.microsoft.com/",
+    license: "CC-BY-4.0",
+    nisar_connection_status: {
+      provider: "ASF DAAC",
+      provider_connectivity: "unknown",
+      authentication_status: "unknown",
+      authentication_checked_at: null,
+      last_successful_search: null,
+      cached_product_count: 0,
+      recorded_download_count: 0,
+      recorded_inspection_count: 0,
+      recorded_processing_count: 1,
+      metadata_only_product_count: 1,
+      latest_recorded_inspection_product_id: null,
+      latest_recorded_inspection_acquisition: null,
+      latest_recorded_processing: null,
+      recorded_error: false,
+    },
+    rivers: [
+      acquisitionRiver("kaveri"),
+      { ...acquisitionRiver("tungabhadra"), nisar_status: "metadata_found", nisar_products: [product] },
+    ],
+  } }));
+  await page.reload();
+
+  const panel = page.getByRole("region", { name: "Automatic satellite data acquisition" });
+  await expect(panel.getByText(/Production bundle: metadata only; raw HDF5 is not hosted/)).toBeVisible();
+  await expect(panel.getByText("Processed — scientifically unvalidated candidate")).toBeVisible();
+  await expect(panel.getByRole("link", { name: "GeoJSON" })).toBeVisible();
+  await expect(panel.getByRole("link", { name: /Download verified NISAR HDF5/ })).toHaveCount(0);
+  await expect(panel.getByText(/Only the capped display GeoJSON is bundled/)).toBeVisible();
+});
+
 test("river selector reflects additional catalog entries without implying monitoring coverage", async ({ page }) => {
   const extra = river("fixture-river", "Fixture River", 77, 14, 12345);
   await page.route("**/api/rivers", (route) => route.fulfill({ json: [...rivers, extra] }));
