@@ -27,9 +27,11 @@ does not provide national coverage, pagination or proof of monitoring.
 
 ## Run the frontend
 
-For the optional Cloudflare Pages and Oracle Always Free deployment, see the
-[deployment guide](./deploy/README.md). Provisioning, public HTTPS and ARM64
-runtime behavior must be verified on the actual VM before announcing the site.
+For the Vercel + Render Free cached-data demonstration setup, see the
+[free deployment guide](./deploy/VERCEL_RENDER_FREE.md). It intentionally
+excludes ignored satellite datasets and does not provide persistent backend
+storage. The separate [Cloudflare Pages and Oracle guide](./deploy/README.md)
+is an alternative and has not been provisioned or verified.
 
 In PowerShell:
 
