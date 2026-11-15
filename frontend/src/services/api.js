@@ -187,6 +187,51 @@ export function sentinel2PreviewUrl(riverId, itemId, indexName, { overview = fal
   return `${API_BASE_URL}/api/sentinel2/${encodeURIComponent(riverId)}/${encodeURIComponent(itemId)}/${indexName}/png?render=3${overview ? "&overview=true" : ""}`;
 }
 
+export function sentinel2IndexUrl(riverId, itemId, indexName) {
+  return `${API_BASE_URL}/api/sentinel2/${encodeURIComponent(riverId)}/${encodeURIComponent(itemId)}/${indexName}/tif`;
+}
+
+export async function downloadSentinel2Index(riverId, itemId, indexName) {
+  let response;
+  try {
+    response = await fetch(sentinel2IndexUrl(riverId, itemId, indexName));
+  } catch {
+    throw new Error("Cannot reach the Sentinel-2 download service. Check the backend connection and try again.");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(typeof payload?.detail === "string"
+      ? payload.detail
+      : `Sentinel-2 download failed (${response.status}).`);
+  }
+  if (!response.headers.get("content-type")?.startsWith("image/tiff")) {
+    throw new Error("The Sentinel-2 service returned an unexpected file type.");
+  }
+  const blob = await response.blob();
+  const signature = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+  const isTiff = (
+    (signature[0] === 0x49 && signature[1] === 0x49 && signature[2] === 42 && signature[3] === 0) ||
+    (signature[0] === 0x4d && signature[1] === 0x4d && signature[2] === 0 && signature[3] === 42)
+  );
+  const filename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
+  const expectedFilename = `${itemId}-${indexName}.tif`;
+  if (!filename || filename !== expectedFilename || !isTiff || blob.size <= 4) {
+    throw new Error("The Sentinel-2 service returned an invalid GeoTIFF download.");
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  return filename;
+}
+
 export async function compareSentinel2Observations({ riverId, earlierItemId, laterItemId }, signal) {
   const result = await request("/api/sentinel2/comparisons", {
     signal,
@@ -210,6 +255,145 @@ export async function compareSentinel2Observations({ riverId, earlierItemId, lat
     throw new Error("The Sentinel-2 comparison API returned an invalid response.");
   }
   return result;
+}
+
+export async function fetchForestObservations(riverId, signal) {
+  const result = await request(`/api/forest/observations?river_id=${encodeURIComponent(riverId)}`, { signal });
+  if (
+    !result ||
+    result.river_id !== riverId ||
+    !Array.isArray(result.observations) ||
+    !Array.isArray(result.distinct_processed_acquisition_times)
+  ) {
+    throw new Error("The forest observation API returned an invalid response.");
+  }
+  return result;
+}
+
+export async function fetchForestReferences(signal) {
+  const result = await request("/api/forest/references", { signal });
+  if (!result || !Array.isArray(result.references)) {
+    throw new Error("The forest reference API returned an invalid response.");
+  }
+  return result;
+}
+
+export async function importForestReference(file, signal) {
+  const form = new FormData();
+  form.append("dataset_id", "esa-worldcover-2021-v200");
+  form.append("reference_file", file);
+  const result = await request("/api/forest/references/import", {
+    signal,
+    method: "POST",
+    body: form,
+  });
+  if (!result || typeof result.reference_id !== "string" || result.status !== "pixels_imported") {
+    throw new Error("The forest reference service returned an invalid import record.");
+  }
+  return result;
+}
+
+export async function submitForestAnalysis({ riverId, itemId, zoneDistancesM }, signal) {
+  const result = await request("/api/forest/analyses", {
+    signal,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      river_id: riverId,
+      item_id: itemId,
+      zone_distances_m: zoneDistancesM,
+    }),
+  });
+  if (!result || typeof result.job_id !== "string" || result.job_type !== "forest_analysis") {
+    throw new Error("The forest analysis service returned an invalid job.");
+  }
+  return result;
+}
+
+export async function submitForestTreeCoverJob(analysisId, referenceId, signal) {
+  const result = await request(
+    `/api/forest/analyses/${encodeURIComponent(analysisId)}/tree-cover-jobs`,
+    {
+      signal,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reference_id: referenceId }),
+    },
+  );
+  if (!result || typeof result.job_id !== "string" || result.job_type !== "forest_tree_cover") {
+    throw new Error("The forest tree-cover service returned an invalid job.");
+  }
+  return result;
+}
+
+export async function fetchAcquisitionJob(jobId, signal) {
+  const result = await request(`/api/acquisition-jobs/${encodeURIComponent(jobId)}`, { signal });
+  if (!result || result.job_id !== jobId || typeof result.status !== "string") {
+    throw new Error("The acquisition job API returned an invalid response.");
+  }
+  return result;
+}
+
+export async function fetchForestAnalysis(analysisId, signal) {
+  const result = await request(`/api/forest/analyses/${encodeURIComponent(analysisId)}`, { signal });
+  if (!result || result.analysis_id !== analysisId || !Array.isArray(result.zones)) {
+    throw new Error("The forest analysis API returned an invalid response.");
+  }
+  return result;
+}
+
+export async function fetchForestZones(analysisId, signal) {
+  const result = await request(
+    `/api/forest/analyses/${encodeURIComponent(analysisId)}/zones.geojson`,
+    { signal },
+  );
+  if (!result || result.type !== "FeatureCollection" || !Array.isArray(result.features)) {
+    throw new Error("The forest zone API returned invalid GeoJSON.");
+  }
+  return result;
+}
+
+export async function fetchForestTreeCoverStatistics(analysisId, referenceId, signal) {
+  const result = await request(
+    `/api/forest/analyses/${encodeURIComponent(analysisId)}/tree-cover/${encodeURIComponent(referenceId)}`,
+    { signal },
+  );
+  if (
+    !result ||
+    result.analysis_id !== analysisId ||
+    result.reference_id !== referenceId ||
+    !Array.isArray(result.zones)
+  ) {
+    throw new Error("The forest tree-cover statistics API returned an invalid response.");
+  }
+  return result;
+}
+
+export async function fetchForestEvidenceSummary(analysisId, signal, referenceId) {
+  const query = referenceId ? `?reference_id=${encodeURIComponent(referenceId)}` : "";
+  const result = await request(
+    `/api/forest/analyses/${encodeURIComponent(analysisId)}/evidence-summary${query}`,
+    { signal },
+  );
+  if (!result || result.analysis_id !== analysisId || !Array.isArray(result.observed_zone_summaries)) {
+    throw new Error("The forest evidence-summary API returned an invalid response.");
+  }
+  return result;
+}
+
+export function forestAnalysisOutputUrl(analysisId, output) {
+  return `${API_BASE_URL}/api/forest/analyses/${encodeURIComponent(analysisId)}/${output}`;
+}
+
+export function forestIndexPreviewUrl(analysisId, indexName) {
+  return forestAnalysisOutputUrl(analysisId, `preview/${indexName}.png`);
+}
+
+export function forestTreeCoverPreviewUrl(analysisId, referenceId) {
+  return forestAnalysisOutputUrl(
+    analysisId,
+    `tree-cover/${encodeURIComponent(referenceId)}/preview.png`,
+  );
 }
 
 export async function searchRiverNetwork(filters, signal) {

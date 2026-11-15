@@ -12,3 +12,7 @@ outputs/*
 !outputs/README.md
 data/*
 !data/README.md
+
+# Local backend satellite data and generated monitoring outputs
+/backend/app/data/acquisitions/
+/backend/app/data/forest_monitoring/

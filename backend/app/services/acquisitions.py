@@ -18,6 +18,7 @@ import httpx
 import numpy as np
 from dotenv import load_dotenv
 
+from app.paths import portable_catalog_path
 from app.redaction import redact_sensitive_text
 from app.schemas.acquisitions import (
     AcquisitionIssue,
@@ -196,6 +197,13 @@ def _database() -> sqlite3.Connection:
         )
         """
     )
+    job_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(acquisition_jobs)")
+    }
+    if "parameters_json" not in job_columns:
+        connection.execute(
+            "ALTER TABLE acquisition_jobs ADD COLUMN parameters_json TEXT NOT NULL DEFAULT '{}'"
+        )
     connection.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_jobs_active_product
@@ -205,6 +213,34 @@ def _database() -> sqlite3.Connection:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_acquisition_jobs_created ON acquisition_jobs(created_at DESC)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forest_analyses (
+            analysis_id TEXT PRIMARY KEY,
+            river_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_directory TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (status IN ('running', 'completed', 'no_data', 'failed'))
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forest_reference_imports (
+            reference_id TEXT PRIMARY KEY,
+            dataset_id TEXT NOT NULL,
+            source_sha256 TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            UNIQUE (dataset_id, source_sha256)
+        )
+        """
     )
     connection.commit()
     return connection
@@ -926,7 +962,7 @@ def _record_verified_nisar_product(
         {
             "download_status": "downloaded",
             "availability": "downloaded_verified",
-            "local_path": str(path.relative_to(REPOSITORY_ROOT)),
+            "local_path": path.relative_to(REPOSITORY_ROOT).as_posix(),
             "acquisition_identifier": product["product_id"],
             "size_bytes": path.stat().st_size,
             "product_type": "GCOV",
@@ -1694,7 +1730,7 @@ def _local_nisar_product_records(river_id: str) -> list[dict[str, Any]]:
                 "availability": "downloaded_verified",
                 "download_status": "downloaded",
                 "source_url": None,
-                "local_path": str(product_path.relative_to(REPOSITORY_ROOT)),
+                "local_path": product_path.relative_to(REPOSITORY_ROOT).as_posix(),
                 "hdf5_groups": groups,
                 "sha256": verification.get("sha256"),
                 "integrity_status": verification.get("integrity_status", "not_verified"),
@@ -2794,7 +2830,7 @@ def nisar_product_path(product_id: str) -> Path:
         for product in json.loads(scan["nisar_products_json"] or "[]"):
             if product.get("product_id") != product_id or not product.get("local_path"):
                 continue
-            path = (REPOSITORY_ROOT / product["local_path"]).resolve()
+            path = (REPOSITORY_ROOT / portable_catalog_path(product["local_path"])).resolve()
             if not path.is_relative_to(ACQUISITION_ROOT.resolve()) or not path.is_file():
                 break
             return path
@@ -2818,7 +2854,7 @@ def _nisar_product_record(
     product = next((item for item in products if item.get("product_id") == product_id), None)
     if not product or not product.get("local_path"):
         raise FileNotFoundError(f"No downloaded NISAR product found for {river_id}/{product_id}.")
-    product_path = (REPOSITORY_ROOT / product["local_path"]).resolve()
+    product_path = (REPOSITORY_ROOT / portable_catalog_path(product["local_path"])).resolve()
     if not product_path.is_relative_to(ACQUISITION_ROOT.resolve()) or not product_path.is_file():
         raise FileNotFoundError(f"The downloaded NISAR product for {product_id} is missing.")
     if product.get("product_level") != "GCOV":

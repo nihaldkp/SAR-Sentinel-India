@@ -34,6 +34,7 @@ import {
 import {
   API_BASE_URL,
   compareSentinel2Observations,
+  downloadSentinel2Index,
   downloadWorkspaceReport,
   fetchAutomaticAcquisitions,
   fetchSentinel2Observations,
@@ -46,6 +47,8 @@ import AutomaticAcquisitionPanel from "./components/AutomaticAcquisitionPanel.js
 import AIAnalysisPanel from "./components/AIAnalysisPanel.jsx";
 import ValidationWorkspace from "./components/ValidationWorkspace.jsx";
 import RiverNetworkExplorer from "./components/RiverNetworkExplorer.jsx";
+import ForestMonitoringPanel from "./components/ForestMonitoringPanel.jsx";
+import GISExplorer from "./components/GISExplorer.jsx";
 
 function toLeafletPolyline(geojsonCoordinates) {
   if (!Array.isArray(geojsonCoordinates)) {
@@ -100,6 +103,7 @@ function buildRealMapRegion(rivers, riverSelection) {
 const navigation = [
   { label: "Overview", icon: BarChart3 },
   { label: "Map explorer", icon: Map },
+  { label: "GIS Explorer", icon: Layers3 },
   { label: "Change analysis", icon: Activity },
   { label: "Impact explorer", icon: Sprout },
   { label: "Agriculture", icon: Sprout },
@@ -600,7 +604,7 @@ function RealOverview({
         <article className="panel map-panel">
           <div className="panel-header map-panel-header">
             <div>
-              <div className="panel-title-row"><h2>Satellite evidence map</h2><span className="panel-live-tag"><span /> REAL DATA ONLY</span></div>
+              <div className="panel-title-row"><h2>Satellite evidence map</h2><span className="panel-live-tag"><span /> LOCAL EVIDENCE</span></div>
               <p className="panel-subtitle">{region.extent}</p>
               <p className="panel-subtitle">Registered river geometry and selected georeferenced evidence layers are shown when available.</p>
               <p className="panel-subtitle">A registered centerline does not establish monitoring coverage.</p>
@@ -682,6 +686,10 @@ function MethodologySection() {
     ["Outputs and metadata", "The pipeline writes a NoData-preserving candidate mask GeoTIFF, two-band measurement GeoTIFF, display-only GeoJSON, and processing metadata."],
     ["Sentinel-1 RTC workflow", "The application reads real Sentinel-1 RTC VV calibrated linear-intensity COG pixels from Microsoft Planetary Computer inside a 3,000 m OSM centerline corridor. Upstream Catalyst RTC radiometric calibration and terrain correction are recorded as provenance; this application does not repeat those upstream steps."],
     ["Sentinel-1 classification limits", "The shared processing converts positive linear power to dB, applies the implemented 5x5 Lee local-statistic filter, estimates an independent Otsu threshold, and writes NoData-preserving candidate outputs. Valid-pixel support and centerline coverage are persisted; the result is an unvalidated candidate, not a validated water or flood measurement."],
+    ["Sentinel-2 vegetation indices", "L2A surface reflectance uses B08/B04 for NDVI, B08/B04/B02 for EVI, and B08/B11 for NDMI. Reflectance bands are scaled by 0.0001, aligned to the native 20 m B11 grid, and masked to SCL classes 4/5 plus valid source pixels. The saved Agriculture indices are centerline-clipped, not crop-field coverage."],
+    ["Forest distance zones", "The Forest workflow reads original Sentinel-2 L2A COGs in bounded windows and summarizes NDVI/EVI/NDMI in configurable centerline-distance rings. Zones describe analysis distance, not forest boundaries; no tree-cover reference raster is currently integrated."],
+    ["Change and interpretation", "Temporal comparisons require compatible rasters and common valid support. Current SAR water differences and optical index differences remain unvalidated candidate signals; seasonal variation, classification error, and causal river effects are not resolved."],
+    ["GIS display and downloads", "GIS raster previews are bounded Web Mercator renderings with transparent NoData. Downloaded GeoTIFFs retain their original grid and metadata. OSM river centerlines are reference geometry, not surveyed banks."],
   ];
   return (
     <section className="workspace-section" aria-label="Data and methodology">
@@ -695,7 +703,7 @@ function MethodologySection() {
       </div>
       <div className="panel limitations-panel">
         <h2>Interpretation limits</h2>
-        <p>Candidate pixels can also represent radar-dark surfaces, shadow, or other non-water targets. The corridor buffer and threshold sensitivity are exploratory diagnostics; no ground-truth accuracy assessment, flood validation, riverbank measurement, or scientific validation is performed.</p>
+        <p>Candidate pixels can also represent radar-dark surfaces, shadow, or other non-water targets. Vegetation indices are not crop or forest classifications. The corridor buffer and threshold sensitivity are exploratory diagnostics; no ground-truth accuracy assessment, flood validation, riverbank measurement, or scientific validation is performed.</p>
       </div>
     </section>
   );
@@ -708,8 +716,9 @@ function AboutSection() {
         <div><div className="eyebrow"><span className="eyebrow-line" /> NASA SPACE APPS CHALLENGE 2026</div><h2>About the project</h2><p>Understanding Indian rivers through openly documented satellite observation workflows.</p></div>
       </div>
       <div className="about-grid">
-        <article className="panel about-card"><h2>Purpose</h2><p>SAR Sentinel India helps teams inspect river and water-body observations, connect them to mapped river corridors, and hand reproducible candidate outputs to GIS analysts.</p></article>
-        <article className="panel about-card"><h2>Supported observations</h2><p>The application supports NISAR GCOV acquisition and candidate processing, Sentinel-1 RTC acquisition and candidate analysis, and OpenStreetMap river centerline context where records are available.</p></article>
+        <article className="panel about-card"><h2>Purpose</h2><p>SAR Sentinel India helps teams inspect Indian river observations using radar and optical satellite data, connect them to mapped river corridors, and hand reproducible candidate outputs to GIS analysts. Satellite imagery can support monitoring when clouds, access, and revisit timing limit field observations, but it does not replace ground validation.</p></article>
+        <article className="panel about-card"><h2>How it works</h2><p>Choose a registered river, inspect locally catalogued observations, review processing provenance and valid-data coverage, then map or download a candidate output. SAR can observe through cloud cover; optical indices provide complementary vegetation signals. Neither alone proves a river impact.</p></article>
+        <article className="panel about-card"><h2>Supported observations</h2><p>The application includes NISAR GCOV and Sentinel-1 RTC candidate water processing, Sentinel-2 L2A vegetation indices and Forest distance-zone summaries, and OpenStreetMap river centerline context where records are available.</p></article>
         <article className="panel about-card"><h2>Current capability</h2><p>Real product records, processing metadata, masks, measurements, and display polygons can be inspected. Overview metrics are derived from the selected river's persisted acquisition records; unavailable measurements are not replaced with illustrative values.</p></article>
         <article className="panel about-card"><h2>Responsible interpretation</h2><p>Outputs labeled candidate or unvalidated are not verified inundation, damage, river boundaries, erosion, deposition, or environmental measurements. Independent GIS and scientific review remains necessary.</p></article>
       </div>
@@ -729,6 +738,28 @@ function Sentinel2MapViewport({ bounds }) {
 
 function Sentinel2Preview({ record, indexName, refreshVersion }) {
   const [failed, setFailed] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
+  const [downloading, setDownloading] = useState(false);
+  const indexValidPixels = record.valid_pixel_counts_by_index?.[indexName]
+    ?? (record.index_statistics?.[indexName] ? record.valid_pixel_count : null);
+  const downloadUnavailableReason = record.raster_reconciliation
+    ? "Catalog and raster grids do not match."
+    : typeof record.output_paths?.[indexName] !== "string"
+      ? `${indexName.toUpperCase()} GeoTIFF output is unavailable.`
+      : typeof indexValidPixels !== "number" || !Number.isFinite(indexValidPixels) || indexValidPixels <= 0
+        ? `No valid ${indexName.toUpperCase()} pixels are recorded.`
+        : "";
+  async function handleDownload() {
+    setDownloading(true);
+    setDownloadError("");
+    try {
+      await downloadSentinel2Index(record.river_id, record.item_id, indexName);
+    } catch (error) {
+      setDownloadError(error.message);
+    } finally {
+      setDownloading(false);
+    }
+  }
   return (
     <figure>
       {failed ? (
@@ -742,10 +773,60 @@ function Sentinel2Preview({ record, indexName, refreshVersion }) {
         />
       )}
       <figcaption>
-        {indexName.toUpperCase()} · valid-pixel mean overview ·{" "}
+        <span>{indexName.toUpperCase()} · valid-pixel mean overview</span>{" "}
         <a href={sentinel2PreviewUrl(record.river_id, record.item_id, indexName)} target="_blank" rel="noreferrer">Full-resolution PNG</a>
+        <div className="sentinel2-download-action">
+          <button type="button" onClick={handleDownload} disabled={downloading || Boolean(downloadUnavailableReason)}>
+            {downloading ? "Preparing GeoTIFF…" : `Download ${indexName.toUpperCase()} GeoTIFF`}
+          </button>
+          {downloadUnavailableReason && <span role="status">Download unavailable: {downloadUnavailableReason}</span>}
+        </div>
+        {downloadError && <span className="inline-error" role="alert">{downloadError}</span>}
       </figcaption>
     </figure>
+  );
+}
+
+function Sentinel2ObservationFacts({ record }) {
+  const validPixelCount = record.valid_pixel_counts_by_index?.ndvi ?? record.valid_pixel_count;
+  const validCenterlinePercent = record.valid_pixel_percent;
+  const validRasterPercent = record.raster_pixel_percent;
+  const corridorPixelCount = record.corridor_pixel_count;
+  const rasterPixelCount = Number.isInteger(record.width) && Number.isInteger(record.height)
+    ? record.width * record.height
+    : null;
+  const acquisitionTime = record.acquisition_datetime && Number.isFinite(Date.parse(record.acquisition_datetime))
+    ? new Date(record.acquisition_datetime).toLocaleString()
+    : "Unavailable";
+
+  return (
+    <div className="sentinel2-observation-facts" role="group" aria-label={`${record.item_id} acquisition metadata and valid-data coverage`}>
+      <div className="sentinel2-observation-fact sentinel2-coverage-fact">
+        <span>Valid NDVI · centerline</span>
+        <strong>{validCenterlinePercent == null ? "Unavailable" : `${validCenterlinePercent.toFixed(2)}%`}</strong>
+        <small>{validPixelCount == null || corridorPixelCount == null ? "Mapped centerline support unavailable" : `${validPixelCount.toLocaleString()} / ${corridorPixelCount.toLocaleString()} pixels`}</small>
+      </div>
+      <div className="sentinel2-observation-fact sentinel2-coverage-fact">
+        <span>Valid NDVI · raster grid</span>
+        <strong>{validRasterPercent == null ? "Unavailable" : `${validRasterPercent.toFixed(3)}%`}</strong>
+        <small>{validPixelCount == null || rasterPixelCount == null ? "Raster support unavailable" : `${validPixelCount.toLocaleString()} / ${rasterPixelCount.toLocaleString()} pixels`}</small>
+      </div>
+      <div className="sentinel2-observation-fact">
+        <span>Acquisition date</span>
+        <strong>{acquisitionTime}</strong>
+        <small>Sentinel-2 L2A</small>
+      </div>
+      <div className="sentinel2-observation-fact">
+        <span>Spatial grid</span>
+        <strong>{record.resolution_m == null ? "Resolution unavailable" : `${record.resolution_m} m`}</strong>
+        <small>{record.crs || "CRS unavailable"}</small>
+      </div>
+      <div className="sentinel2-observation-fact">
+        <span>NoData</span>
+        <strong>{record.nodata == null ? "Unavailable" : String(record.nodata)}</strong>
+        <small>Stored GeoTIFF value</small>
+      </div>
+    </div>
   );
 }
 
@@ -819,6 +900,7 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
   const [sentinel2Status, setSentinel2Status] = useState("loading");
   const [sentinel2Error, setSentinel2Error] = useState("");
   const [sentinel2Refresh, setSentinel2Refresh] = useState(0);
+  const refreshFromSource = useRef(false);
   const [selectedIndex, setSelectedIndex] = useState("ndvi");
   const [mapOpacity, setMapOpacity] = useState(0.85);
   const [selectedRecordKey, setSelectedRecordKey] = useState("");
@@ -826,9 +908,11 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
   useEffect(() => {
     const controller = new AbortController();
     const riverIds = riverSelection === "both" ? ["kaveri", "tungabhadra"] : [riverSelection];
+    const refresh = refreshFromSource.current;
+    refreshFromSource.current = false;
     setSentinel2Status("loading");
     setSentinel2Error("");
-    Promise.all(riverIds.map((riverId) => fetchSentinel2Observations(riverId, { signal: controller.signal })))
+    Promise.all(riverIds.map((riverId) => fetchSentinel2Observations(riverId, { refresh, signal: controller.signal })))
       .then((responses) => {
         setSentinel2ByRiver(Object.fromEntries(responses.map((response) => [response.river_id, response])));
         setSentinel2Status("loaded");
@@ -845,6 +929,13 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
     ? Object.values(sentinel2ByRiver).flatMap((response) => response.observations)
     : [];
   const processedRecords = sentinel2Records.filter((record) => record.status === "processed");
+  const distinctAcquisitionTimes = new Set(
+    processedRecords
+      .map((record) => record.acquisition_datetime)
+      .filter(Boolean)
+      .map((value) => Date.parse(value))
+      .filter(Number.isFinite),
+  );
   const selectedRecord = processedRecords.find((record) => `${record.river_id}-${record.item_id}` === selectedRecordKey)
     || processedRecords[0]
     || null;
@@ -890,12 +981,49 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
         </div>
         {domain === "forest" && (
           <div className="monitoring-limitations">
-            <strong>Forest-specific evidence is not yet available</strong>
-            <span>These indices describe spectral vegetation and moisture signals, not forest cover or forest loss. Distinguishing natural forest from plantations and agricultural vegetation requires suitable independent land-cover references; forest classification and change validation are not implemented.</span>
-            <span>River-distance zones (0–100 m, 100–500 m and 500–1,000 m) and near-versus-outer comparisons are unavailable: the saved index rasters sample only the mapped centerline, and no suitable local tree-cover reference is integrated.</span>
+            <strong>Centerline indices and forest classification are distinct products</strong>
+            <span>These saved indices describe spectral vegetation and moisture signals, not forest cover or forest loss. The river-side zone analysis above reads the original Sentinel-2 L2A assets; these cached index rasters remain clipped to the mapped centerline.</span>
+            <span>No tree-cover reference raster is integrated. Distinguishing natural forest from plantations and agricultural vegetation, or validating forest change, remains unsupported.</span>
           </div>
         )}
       </div>
+      {domain === "agriculture" && (
+        <aside className="agriculture-scope-note" role="note">
+          <strong>Vegetation indices—not crop maps</strong>
+          <span>NDVI, EVI and NDMI are spectral indices. This page does not classify crops or assess crop health, yield or field condition.</span>
+          <span>These cached rasters are clipped to mapped river-centerline coverage; they do not map the full agricultural area or surrounding fields.</span>
+        </aside>
+      )}
+      {domain === "forest" && sentinel2Status === "loaded" && (
+        <section className="panel workspace-panel" aria-label="Forest evidence summary">
+          <div className="panel-header">
+            <div>
+              <h2>Forest evidence status</h2>
+              <p className="panel-subtitle">Counts below describe persisted Sentinel-2 tile records and acquisition timestamps, not forest area or monitoring coverage.</p>
+            </div>
+          </div>
+          <div className="sentinel2-metric-grid">
+            <div className="sentinel2-index-card">
+              <strong>Processed tile records</strong>
+              <span>{processedRecords.length}</span>
+              <small>Each tile is counted separately; overlapping tile footprints are not additive.</small>
+            </div>
+            <div className="sentinel2-index-card">
+              <strong>Distinct acquisition times</strong>
+              <span>{distinctAcquisitionTimes.size}</span>
+              <small>{distinctAcquisitionTimes.size < 2 ? "A multi-date vegetation trend is unavailable." : "Date differences still require common-support and seasonal review."}</small>
+            </div>
+            <div className="sentinel2-index-card">
+              <strong>Forest interpretation</strong>
+              <span>Not established</span>
+              <small>No forest/tree-cover reference layer is integrated; index values are spectral observations only.</small>
+            </div>
+          </div>
+          <p className="monitoring-limitations">
+            River-distance statistics are available in the raw-asset zone analysis above. The GeoTIFF downloads in this section are separate, centerline-clipped outputs; the OSM centerline is not a verified bank or active channel.
+          </p>
+        </section>
+      )}
       <div className="panel workspace-panel sentinel2-monitoring-panel">
         <div className="panel-header">
           <div>
@@ -905,7 +1033,15 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
           </div>
           <div className="sentinel2-panel-actions">
             <span className="evidence-disclosure">{sentinel2Status === "loaded" ? `${sentinel2Records.length} record${sentinel2Records.length === 1 ? "" : "s"}` : sentinel2Status === "error" ? "Unavailable" : "Loading"}</span>
-            <button type="button" onClick={() => setSentinel2Refresh((value) => value + 1)}>Refresh saved records</button>
+            <button
+              type="button"
+              onClick={() => {
+                refreshFromSource.current = true;
+                setSentinel2Refresh((value) => value + 1);
+              }}
+            >
+              Refresh and reprocess from source
+            </button>
           </div>
         </div>
         {sentinel2Error && <p className="inline-error">{sentinel2Error}</p>}
@@ -959,13 +1095,14 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
             <div className="sentinel2-observation-header">
               <div>
                 <h3>{record.river_id} · {record.item_id}</h3>
-                <p>{record.acquisition_datetime ? new Date(record.acquisition_datetime).toLocaleString() : "Acquisition date unavailable"} · {record.status}</p>
+                <p>{record.status.replaceAll("_", " ")} · {record.source}</p>
               </div>
               <span className="evidence-disclosure">Land-cover and change unvalidated</span>
             </div>
             {record.raster_reconciliation && (
               <p className="monitoring-limitations" role="status">{record.raster_reconciliation.reason} Stored catalog: {record.raster_reconciliation.catalog_metadata.width} × {record.raster_reconciliation.catalog_metadata.height}, {record.raster_reconciliation.catalog_metadata.valid_pixel_count} NDVI valid pixels; current raster: {record.width} × {record.height}, {record.valid_pixel_count} NDVI valid pixels.</p>
             )}
+            <Sentinel2ObservationFacts record={record} />
             {record.status === "processed" ? (
               <>
                 <div className="sentinel2-metric-grid">
@@ -1009,11 +1146,7 @@ function LandMonitoringSection({ title, eyebrow, description, catalog, status, e
                     <Sentinel2Preview key={`${indexName}-${sentinel2Refresh}`} record={record} indexName={indexName} refreshVersion={sentinel2Refresh} />
                   ))}
                 </div>
-                <p className="panel-subtitle">
-                  {record.cloud_cover_percent == null ? "Cloud cover unavailable" : `${record.cloud_cover_percent.toFixed(1)}% cloud cover`} ·
-                  {" "}{record.valid_pixel_percent == null ? "Centerline coverage unavailable" : `${record.valid_pixel_percent.toFixed(2)}% valid centerline pixels`} ·
-                  {" "}{record.raster_pixel_percent == null ? "Raster coverage unavailable" : `${record.raster_pixel_percent.toFixed(3)}% of raster pixels valid`} · {record.crs || "CRS unavailable"} · {record.resolution_m == null ? "Resolution unavailable" : `${record.resolution_m} m`}
-                </p>
+                <p className="panel-subtitle">{record.cloud_cover_percent == null ? "Cloud cover unavailable" : `${record.cloud_cover_percent.toFixed(1)}% cloud cover`} · Coverage percentages above describe valid NDVI pixels.</p>
               </>
             ) : (
               <p>Real observation unavailable — {record.error || "processing did not produce usable pixels"}.</p>
@@ -1142,7 +1275,7 @@ function App() {
   const selectedFootprint = selectedObservation?.footprint?.coordinates
     ? selectedObservation.footprint
     : null;
-  const isEvidencePage = ["Overview", "Map explorer", "Change analysis", "Impact explorer", "Data & methodology", "About the project", "Agriculture", "Forest monitoring", "AI analysis"].includes(activePage);
+  const isEvidencePage = ["Overview", "Map explorer", "GIS Explorer", "Change analysis", "Impact explorer", "Data & methodology", "About the project", "Agriculture", "Forest monitoring", "AI analysis"].includes(activePage);
   const isChangeAnalysisPage = activePage === "Change analysis";
   const isFunctionalPage = isEvidencePage || isChangeAnalysisPage;
 
@@ -1326,7 +1459,7 @@ function App() {
             <div className="breadcrumb">Workspace <span>/</span> <strong>{activePage}</strong></div>
           </div>
           <div className="topbar-right">
-            <div className={`status-pill ${nisarStatus === "loaded" ? "status-pill-connected" : nisarStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> Satellite API {nisarStatus === "loaded" ? "CONNECTED · REAL DATA" : nisarStatus === "error" ? "UNAVAILABLE" : "CONNECTING"}</div>
+            <div className={`status-pill ${nisarStatus === "loaded" ? "status-pill-connected" : nisarStatus === "error" ? "status-pill-error" : ""}`}><span className="status-dot" /> Local product catalog · {nisarStatus === "loaded" ? "AVAILABLE" : nisarStatus === "error" ? "UNAVAILABLE" : "LOADING"}</div>
             <button className="profile-button" title="Project workspace" type="button">SI</button>
           </div>
         </header>
@@ -1334,15 +1467,15 @@ function App() {
         <div className="page-content">
           <div className="demo-banner" role="status">
             <div className="demo-banner-icon"><Radio size={16} /></div>
-            <div><strong>Real data only</strong><span>Overview values come from persisted satellite acquisition records, processing outputs, and registered river geometry. When a real observation is unavailable, no substitute measurement is shown.</span></div>
-            <span className="demo-banner-tag">REAL DATA</span>
+            <div><strong>Evidence-first monitoring</strong><span>Persisted observations and processing outputs are shown with their provenance and validation state. Candidate results remain unvalidated, and missing measurements are not replaced with invented values.</span></div>
+            <span className="demo-banner-tag">LOCAL EVIDENCE</span>
           </div>
 
           {nisarStatus === "error" && (
             <div className="api-error-banner" role="alert">
               <CircleHelp size={16} />
-            <div><strong>Satellite acquisition catalog unavailable</strong><span>{nisarError} {NO_REAL_MEASUREMENT}</span></div>
-            <button onClick={() => { setNisarStatus("loading"); setNisarError(""); setNisarCatalog(null); setNisarRetry((retry) => retry + 1); }} type="button">Retry connection</button>
+            <div><strong>Local acquisition catalog unavailable</strong><span>{nisarError} {NO_REAL_MEASUREMENT}</span></div>
+            <button onClick={() => { setNisarStatus("loading"); setNisarError(""); setNisarCatalog(null); setNisarRetry((retry) => retry + 1); }} type="button">Retry catalog</button>
             </div>
           )}
 
@@ -1387,6 +1520,7 @@ function App() {
           {isChangeAnalysisPage && <ChangeAnalysis catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
           {isEvidencePage ? (
             <>
+              {activePage === "GIS Explorer" && <GISExplorer riverSelection={riverSelection} onSelectRiver={selectRiverId} />}
               {(activePage === "Overview" || activePage === "Map explorer") && (
                 <RealOverview
                   catalog={nisarCatalog}
@@ -1411,8 +1545,13 @@ function App() {
                 />
               )}
               {activePage === "Impact explorer" && <ImpactExplorer catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} />}
-              {activePage === "Agriculture" && <LandMonitoringSection title="Agriculture monitoring" eyebrow="AGRICULTURE · SATELLITE EVIDENCE" description="Review available satellite observations around registered river corridors without inventing crop or vegetation measurements." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="agriculture" onReportContext={setLandReportContext} />}
-              {activePage === "Forest monitoring" && <LandMonitoringSection title="Forest monitoring" eyebrow="FORESTS · SATELLITE EVIDENCE" description="Review available satellite observations and understand which forest and vegetation analyses are not yet supported." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="forest" onReportContext={setLandReportContext} />}
+              {activePage === "Agriculture" && <LandMonitoringSection title="Agriculture monitoring" eyebrow="AGRICULTURE · SATELLITE EVIDENCE" description="Review cached Sentinel-2 NDVI, EVI and NDMI observations. These vegetation indices are not crop classifications or crop-health assessments." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="agriculture" onReportContext={setLandReportContext} />}
+              {activePage === "Forest monitoring" && (
+                <>
+                  <ForestMonitoringPanel riverSelection={riverSelection} onSelectRiver={selectRiverId} onReportContext={setLandReportContext} />
+                  <LandMonitoringSection title="Sentinel-2 centerline observations and assessments" eyebrow="SOURCE INDICES · NOT ZONE STATISTICS" description="Inspect the existing centerline-clipped NDVI, EVI and NDMI products and their sample-scoped index assessments." catalog={nisarCatalog} status={nisarStatus} error={nisarError} riverSelection={riverSelection} domain="forest" onReportContext={setLandReportContext} />
+                </>
+              )}
               {activePage === "Data & methodology" && <MethodologySection />}
               {activePage === "About the project" && <AboutSection />}
               {activePage === "Change analysis" && (

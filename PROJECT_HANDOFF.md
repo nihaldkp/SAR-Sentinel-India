@@ -1,8 +1,263 @@
 # SAR Sentinel India — Session Handoff
 
-**Updated:** 2026-11-10
+**Updated:** 2026-11-15
 
 **Workspace:** `D:\SAR-Sentinel-India`
+
+## 2026-11-15 — cached-data presentation handoff
+
+Presentation status is **cached-data demo ready with disclosed limitations**.
+Do not present the application as scientifically validated or as providing
+full-corridor Agriculture/Forest monitoring.
+
+Agriculture download verification used no discovery or acquisition: 15
+available NDVI/EVI/NDMI responses across five observations matched the actual
+local GeoTIFFs byte-for-byte and reopened in Rasterio. Valid rectangular-grid
+fractions ranged from 0.071069% to 0.833680%; the products are
+centerline-clipped. Five older catalog records lack affine transforms; their
+downloads are allowed only after the actual index rasters pass grid and
+geospatial checks, and responses carry
+`X-Raster-Catalog-Georeferencing: reconciled-from-geotiff`. Kaveri T43PHP has
+a wider catalog/raster dimension mismatch; its three downloads are withheld,
+and the frontend reports the mismatch. No local rasters or catalog metadata
+were rewritten during this audit.
+
+The GIS catalog has 69 available and 4 unavailable entries. Forest has
+two partial tile analyses from 2026-11-13, no imported WorldCover pixels, no
+temporal vegetation comparison, and no matched water/vegetation analysis.
+NISAR and Sentinel-1 outputs are candidates without independent validation.
+AI summaries are deterministic. No automatic acquisition, source refresh,
+large download, commit, or push was performed.
+
+Use the cached walkthrough in [README.md](./README.md). Final verification:
+backend **272 passed, 3 skipped**; full Playwright **37 passed**; Python
+`compileall`, `pip check`, frontend production build, `npm ls --depth=0`, and
+`git diff --check` passed. The build reports a 528.30 kB chunk above the 500
+kB advisory. Backend warnings include Starlette/httpx deprecation and
+Rasterio fixture georeferencing; skipped tests require opt-in live Earthdata
+checks or Windows symlink privileges.
+
+## GIS Explorer — implementation handoff
+
+The dedicated GIS Explorer reuses local river, Sentinel-2, Forest, Sentinel-1,
+NISAR and existing SQLite-catalog data. Current catalog inventory is 69
+available layers and four unavailable entries: river-bank boundaries,
+flood/inundation, administrative boundaries and tree-cover reference. The
+page and backend do not present unavailable layers as data. Existing SAR water
+layers are explicitly candidates; Sentinel-2 indices remain
+centerline-clipped.
+
+Routes added under `/api/gis`:
+
+- `GET /layers`, `/layers/{layer_id}/metadata`, `/features`,
+  `/preview.png`, `/download`
+- `POST /inspect`, `POST /measure`
+- `POST /layers/import`, `DELETE /layers/{layer_id}`
+
+Raster previews are EPSG:3857 WarpedVRT displays capped at 512 pixels per side,
+with NoData transparent. Native downloads preserve the original raster.
+Measurements use centroid-selected UTM for length and EPSG:6933 for polygon
+area. GeoJSON imports are WGS84/CRS84 only, at most 10 MiB/50,000 features,
+and stored under `backend/app/data/gis_explorer/uploads/` with existing
+SQLite metadata; imported layers are temporary and removable.
+
+Frontend features include river selection, layer search/toggles/opacity/order,
+zoom-to-layer, legend, map scale, coordinate and feature/pixel inspection,
+distance/area measurement, point/line/polygon drawing, GeoJSON import/export,
+and raster/vector/CSV downloads. Detailed contracts and limitations are in
+[docs/GIS_EXPLORER.md](./docs/GIS_EXPLORER.md).
+
+Verification: full backend **272 passed, 3 skipped**; Python compile,
+`pip check`, frontend build, `npm ls --depth=0`, and `git diff --check` passed.
+Full Playwright: **37 passed** after removing the stale Agriculture scroll
+locator and adding the responsive all-pages check; the GIS browser test passed,
+including the preview-error state. The three backend skips are two opt-in live
+Earthdata checks and the Windows symlink-privilege test. Backend warnings are
+the existing Starlette/httpx deprecation and Rasterio fixture
+georeferencing notices; the frontend build retains the >500 kB chunk warning.
+No datasets were downloaded, no GIS output was generated, and no commit/push
+was made. The module does not add bank lines, flood maps, administrative
+boundaries, tree-cover pixels, area-wide Sentinel-2 coverage or scientific
+validation.
+
+## 2026-11-15 — Agriculture download audit (completed correction; partial area scope)
+
+The reported `ndvi.tif` was a valid 4,503 × 794 Float32 EPSG:32644 GeoTIFF
+with NoData `-9999`, not a corrupt response. Its original 4,585 valid pixels
+were 0.128% of all 3,575,382 rectangular cells, but 97.55% of the 4,700
+mapped centerline cells. The rectangle is transparent outside the line by
+design; there is no defined Agriculture parcel or bank-to-bank analysis area.
+
+A separate producer issue was verified from the actual source: SCL class 6
+(water) and class 7 (unclassified) were counted as valid vegetation. The
+recorded 2026-11-13T05:10:41.025Z Kaveri T44PKT observation was regenerated
+with processor `sentinel2-indices-1.5`, accepting only SCL classes 4 and 5,
+retaining source masks, and using bounded source-mask reads. B02/B04/B08 are
+scaled by 0.0001 and bilinearly aligned to the B11 20 m grid. The generated
+files are under
+`backend/app/data/acquisitions/sentinel2/kaveri/S2C_MSIL2A_20261113T051041_R019_T44PKT_20261113T100104/`.
+Each of NDVI/EVI/NDMI has 2,541 finite pixels, Float32, EPSG:32644,
+4,503 × 794, NoData -9999; shared valid support is 54.0638% of 4,700
+centerline cells and 0.071069% of the rectangular grid. SCL 6 water count is
+1,530 and SCL 7 count is 514 on that centerline. The NDVI range is
+-0.09330 to 0.57866. None of the excluded pixels were filled.
+
+`GET /api/sentinel2/{river_id}/{item_id}/{index_name}/tif` now verifies the
+catalog entry, all three raster grids, CRS, dtype, NoData and readable valid
+pixels before serving the requested file; it returns HTTP 404 for missing
+records and 409 for stale/incompatible or empty products. The response has an
+item/index-specific filename and coverage headers. Agriculture uses a fetch
+download handler with content-type/signature/filename checks and visible
+error states. UI captions and PDF evidence report both raster-grid and
+centerline coverage. “Refresh and reprocess from source” explicitly passes
+`refresh=true`; it may read only the source windows needed by the supported
+scene workflow and is not triggered automatically.
+
+Actual endpoint verification returned HTTP 200 for all three downloads. Each
+response byte-for-byte matched its generated file; Rasterio reopened all
+three with the recorded grid/metadata and 2,541 valid pixels. Focused
+Sentinel-2 tests passed 14/14; full backend passed **265 passed, 3 skipped**;
+full Playwright passed **35/35**; Python compilation, `pip check`, frontend
+production build and `git diff --check` passed. The browser test verifies all
+three downloads, filenames/TIFF signatures, coverage text, refresh query and
+visible insufficient-data errors. An initial run exposed a refresh-render
+timing race in the test; waiting for the refreshed observation resolved it.
+No commit/push was made.
+
+The correction does not create an area-wide Agriculture product or establish
+crop health/yield. The low raster-grid valid percentage is expected for
+centerline-clipped output. No independent reference validation was performed.
+
+## 2026-11-15 — Forest reference workflow continuation (partial)
+
+Forest processor version 1.3 now reprojects source-validity masks for SCL and
+the 10 m reflectance bands in bounded windows; NoData and the SCL 4/5 rule
+remain in force. The processor version is part of the analysis identity, so
+prior outputs are not reused for new jobs. Existing real pilot outputs were
+not regenerated in this continuation.
+
+The local reference workflow is now implemented without fetching satellite
+data:
+
+- `POST /api/forest/references/import` accepts an ESA WorldCover 2021 v200
+  single-band uint8 GeoTIFF (100 MiB and 80-million source-pixel limits),
+  validates grid metadata, stores a SHA-256-addressed copy, and records
+  provenance. Dataset identity is user-supplied, not independently
+  authenticated.
+- `POST /api/forest/analyses/{analysis_id}/tree-cover-jobs` queues persistent
+  per-zone class-10 statistics through the SQLite acquisition-job system.
+- `GET /api/forest/analyses/{analysis_id}/tree-cover/{reference_id}` returns
+  zonal class area and valid-data coverage; associated routes download the
+  EPSG:6933 10 m class raster and CSV and provide a PNG preview.
+- The Forest page supports local upload, job progress, table/downloads, and an
+  optional tree-cover map overlay. Evidence summaries can include the
+  persisted tree-cover result.
+
+No actual WorldCover raster was downloaded or imported. Synthetic GeoTIFF
+tests verify import idempotency, CRS reprojection, per-zone measures,
+insufficient-data withholding, API downloads/previews, and deterministic
+evidence grounding. WorldCover class 10 includes plantations, is partly
+Sentinel-2-derived, and predates the 2026 observations; it cannot establish
+independent forest truth, natural forest, or change. No multi-date optical
+comparison or matched river-water observations are present, so temporal
+change and river–vegetation analysis remain unavailable. This work does not
+complete the Forest monitoring checklist item.
+
+If a user imports a local reference, its content-addressed raster and metadata
+are stored under
+`backend/app/data/forest_monitoring/references/<reference_id>/`; derived
+summaries, CSVs and (when valid) rasters are stored below the matching
+forest-analysis output directory in `tree-cover/<reference_id>/`. No such
+real reference output was generated in this continuation. The existing real
+pilot observations remain the 2026-11-13T05:10:41.025Z Sentinel-2 scenes
+documented below; they were not reprocessed with processor 1.3.
+
+Final verification: backend **267 passed, 3 skipped**; full Playwright had
+**34 passed and one intermittent failure** in the existing Agriculture
+refresh/scroll test (isolated rerun passed); the Forest browser workflow
+passed. Frontend production build passed with a >500 kB chunk warning; Python
+`compileall`, `pip check`, and `git diff --check` passed. The three backend
+skips are the two opt-in live Earthdata tests and the Windows symlink-
+privilege test. No commits or pushes were made.
+
+## 2026-11-15 — Forest zone-processing handoff (partial)
+
+Implemented a real, bounded Sentinel-2 L2A workflow for river-side analysis
+zones. `POST /api/forest/analyses` validates a local item and configurable
+outer distances, queues a persistent `forest_analysis` job, and writes
+GeoTIFFs (NDVI/EVI/NDMI), GeoJSON zone geometries, CSV metrics, and a JSON
+summary under `backend/app/data/forest_monitoring/`. Metadata includes date,
+item/product identity, source asset paths, source footprint/cloud metadata,
+CRS, resolution, affine grid transform, masks/resampling, processing version,
+checksums, and valid/raster coverage. Poll the existing acquisition-job
+endpoint; completed jobs include an analysis reference.
+
+The Forest page now selects river, available local Sentinel-2 item, zone
+distances and index; displays source footprints/centerline, zone overlays and
+preview rasters; charts per-zone statistics; and links actual outputs. The
+evidence-summary endpoint is deterministic and built only from the saved
+analysis summary; it is not an external LLM conclusion.
+
+Actual pilot inputs: Kaveri
+`S2C_MSIL2A_20261113T051041_R019_T44PKS_20261113T100104` and Tungabhadra
+`S2C_MSIL2A_20261113T051041_R019_T44PKC_20261113T100104`, both acquired
+2026-11-13T05:10:41.025Z and processed at 20 m / EPSG:32644. Each is one
+catalogued tile covering only a segment of its river corridor. Four-zone
+valid-data coverage is Kaveri 63.5%, 72.4%, 67.0%, 62.3%; Tungabhadra 23.7%,
+28.7%, 51.3%, 77.0%. Raster coverage is separately recorded in the JSON/CSV
+outputs. Do not interpret index means as tree-cover area, forest condition,
+or deforestation.
+Current analysis IDs are `cdf6a16f5786d63caf06e505fdad8cb4038fac82ac503b6c5d71693834c12a23`
+(Kaveri) and `8690117ed95aebf732826cc3165047c171e816728aaaa60b5f2023570e051378`
+(Tungabhadra), under `backend/app/data/forest_monitoring/`. Verified summary,
+GeoJSON, CSV, GeoTIFF, preview and evidence-summary routes all returned HTTP
+200; raster grids, CRS, affine transform and NoData matched the summary.
+
+Reference status: ESA WorldCover 2021 v200 is metadata-only; no tree-cover
+pixels are integrated. It includes plantations and is Sentinel-2-derived, so
+it would not independently validate these indices. There is only one
+processed optical acquisition time; temporal changes cannot be estimated.
+Current radar water candidates are not temporally/spatially harmonized with
+these zones; no water/vegetation relationship is computed. No independent
+validation has been done.
+
+The superseded v1.0/v1.1 directories and four catalog records were removed
+after confirming no acquisition-job outputs referenced them.
+
+Verification completed: backend **262 passed, 3 skipped**; full Playwright
+**35 passed**; frontend production build passed; Python `compileall` passed;
+`pip check` reported no broken requirements; and `git diff --check` passed.
+The three skips are two opt-in live Earthdata tests and a Windows symlink test
+unavailable without elevated symlink privilege. The 18 backend warnings are
+the existing Starlette/httpx deprecation and Rasterio warnings from synthetic
+PNG fixtures. An initial backend run from the repository root failed only
+because a subprocess CORS test imports `app` relative to the backend working
+directory; rerunning the full suite from `backend/` passed. See
+[README.md](./README.md) for workflow and limitations.
+
+## 2026-11-15 — Forest workspace continuation (partial)
+
+The Forest monitoring workspace now displays a deterministic evidence summary:
+processed Sentinel-2 tile records, distinct acquisition timestamps, and an
+explicit unavailable state for a multi-date trend when there is only one
+timestamp. Existing NDVI/EVI/NDMI index cards now link to their corresponding
+GeoTIFF downloads. The local API returned seven Kaveri/Tungabhadra catalog
+records, six processed tile outputs and one Kaveri no-usable-pixels result; the
+six processed tiles share the 2026-11-13T05:10:41Z acquisition time. The
+selected cached NDVI GeoTIFF downloads returned HTTP 200.
+
+This is a workspace integration improvement, not a complete forest-monitoring
+module. Current vegetation rasters are masked to the OSM centerline, not
+surrounding land; one processed date cannot establish a trend; no tree-cover
+reference layer is integrated. Forest mapping, river-distance zones,
+forest-change/river relationship analysis and forest-specific AI explanation
+remain unimplemented or blocked by suitable data. No satellite product was
+downloaded or reprocessed.
+
+Verification: backend 252 passed/3 skipped; browser 34 passed; frontend build,
+Python compile, `pip check`, and `git diff --check` passed. The full browser run
+initially had one transient locator failure in an existing Agriculture refresh
+test; that test passed alone and the subsequent full browser run passed.
 
 ## Finalization audit — current handoff status (2026-11-10)
 

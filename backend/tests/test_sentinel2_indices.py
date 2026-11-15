@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from app.services.sentinel2 import calculate_indices
+from app.services.sentinel2 import _scene_classification_mask, calculate_indices
 
 
 def test_indices_apply_surface_reflectance_scaling_and_formulas() -> None:
@@ -27,3 +27,13 @@ def test_indices_exclude_invalid_pixels_and_zero_denominators() -> None:
     assert np.isnan(result["ndvi"][0, 1])
     assert np.isnan(result["evi"][0, 1])
     assert np.isnan(result["ndmi"][0, 1])
+
+
+def test_scene_classification_mask_keeps_vegetation_only() -> None:
+    scl = np.array([[4, 5, 6, 7, 3, 8, 9, 10, 11, 0]], dtype=np.uint8)
+    source_valid = np.ones(scl.shape, dtype=bool)
+    source_valid[0, 1] = False
+
+    valid = _scene_classification_mask(scl, source_valid)
+
+    assert valid.tolist() == [[True, False, False, False, False, False, False, False, False, False]]

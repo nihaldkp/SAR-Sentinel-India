@@ -27,6 +27,10 @@ does not provide national coverage, pagination or proof of monitoring.
 
 ## Run the frontend
 
+For the optional Cloudflare Pages and Oracle Always Free deployment, see the
+[deployment guide](./deploy/README.md). Provisioning, public HTTPS and ARM64
+runtime behavior must be verified on the actual VM before announcing the site.
+
 In PowerShell:
 
 ```powershell
@@ -74,6 +78,10 @@ Initial endpoints:
 - `GET /api/observations?region_id=krishna-karnataka`
 - `GET /api/rivers`
 - `GET /api/rivers/{river_id}`
+- `GET /api/gis/layers?river_id=both|kaveri|tungabhadra`
+- `GET /api/gis/layers/{layer_id}/metadata`, `/features`, `/preview.png`, and `/download`
+- `POST /api/gis/inspect`, `POST /api/gis/measure`
+- `POST /api/gis/layers/import` and `DELETE /api/gis/layers/{layer_id}` for temporary GeoJSON layers
 - `GET /api/satellite/search?river_id=kaveri&mission=NISAR&start_date=2026-10-01&end_date=2026-10-31&product_type=GCOV`
 - `GET /api/acquisitions`
 - `POST /api/acquisitions/nisar/metadata` — registers metadata for the explicitly supplied ASF product ID only; it does not download the HDF5 product or start an acquisition job.
@@ -134,6 +142,14 @@ The map includes OpenStreetMap/Nominatim relation centerlines for the Kaveri (re
 
 The official 2025-11-17 KML is stored locally at `data/nwic/river_network_2025-11-17.kml` (261,635,405 bytes, SHA-256 `e360257af967e954efb87d3172b0c74a813a05f82fef3a5e404973357d57bf06`); the resumable KML importer completed 30,395 features. The explorer distinguishes missing, incomplete and completed imports. It links only two verified source identities to the pilot selector: object 548 / river 6983 (Cauvery) and object 245 / river 2912 (Tungabhadra), when the recorded source fingerprint and version match and each line has at least 95% of its length within 1,500 m of the other line in EPSG:32643. The observed mutual overlaps exceed 98%. Other features, including unrelated Kaveri records in the Narmada basin, remain unlinked. This matches reference geometries; it does not establish satellite coverage, observed water, or independent validation.
 
+## GIS Explorer
+
+The **GIS Explorer** page provides an interactive Leaflet/OSM map for the local project catalog. It supports layer visibility, opacity, ordering, zoom-to-layer, a visible-layer legend, scale, coordinate display, reset/fullscreen controls, vector feature inspection, raster pixel inspection, distance/area measurements, point/line/polygon drawings, GeoJSON import/export, and layer downloads. Imported GeoJSON is temporary and removable; it is not added to original source datasets.
+
+The local catalog currently reports **69 available layers and 4 unavailable layer types**. Available data include the registered Kaveri/Tungabhadra centerlines, locally processed Sentinel-2 indices, Forest zone outputs, Sentinel-1 candidate water masks/display polygons, NISAR candidate mask/display polygon, and locally registered reference outputs. Existing NISAR/Sentinel-1 classifications are candidate products, not validated water boundaries. Sentinel-2 index rasters are centerline-clipped; Forest observations are tile/zone-specific. Available observation dates are recorded per layer, not inferred from other datasets. River-bank boundaries, flood/inundation, administrative boundaries and a tree-cover reference raster are explicitly shown as unavailable.
+
+Raster previews are reprojected from each source CRS to EPSG:3857 and capped at 512 pixels on the longest side; transparent pixels preserve NoData. Their bounds are transformed to WGS84 for display. Downloads return the actual source GeoTIFF or vector data, while vector CSV export contains source feature attributes. Point inspection samples the source raster grid and reports NoData/out-of-bounds states. Length measurements transform GeoJSON geometries from WGS84 to the centroid's UTM zone; area uses EPSG:6933. Uploaded GeoJSON is limited to 10 MiB and 50,000 features, validates WGS84/CRS84 geometry, and is stored in a dedicated temporary directory with SQLite metadata. See [GIS Explorer documentation](./docs/GIS_EXPLORER.md) for routes, formats, limits, and scientific limitations.
+
 ### Workspace PDF reports
 
 The page-level **Export** button downloads a report for the active workspace and selected study area without requiring a candidate analysis. Agriculture and Forest reports use the selected saved index GeoTIFF and disclose applicable recorded reference assessments; map reports include a schematic OSM centerline, not a screenshot or selected raster layer. Missing measurements and imagery are identified as unavailable. Interpretation is deterministic and data-grounded; no AI model or external AI service is used. Existing candidate mask, GeoJSON and candidate-report downloads remain separate.
@@ -144,11 +160,70 @@ Automatic acquisition scheduling is **disabled by default**. To opt in, set `SAR
 
 ### Sentinel-2 vegetation index previews
 
-The Agriculture and Forest monitoring previews render each observation's own NDVI, EVI or NDMI GeoTIFF, using a fixed linear -1 to +1 display range (blue `#313695` at -1, pale yellow `#ffffbf` at 0, green `#006837` at +1); values outside the range are clipped for display only. Invalid and masked pixels are transparent. The source rasters mask to the mapped river centerline, not a surrounding land area, so most of a rectangular preview can legitimately be transparent. The map PNG is reprojected with nearest-neighbour sampling to Web Mercator and its WGS84 bounds are reported with the observation. Thumbnail requests use `overview=true` to reproject to at most 256 pixels on the longest side and average valid source values per output cell; empty cells remain transparent. The coloured footprint of a thumbnail cell is not a measurement of valid area. The PNG endpoint reads the GeoTIFF on each request; legacy saved PNGs are not used by it. Source rasters and statistics are not changed by rendering.
+The Agriculture and legacy Sentinel-2 observation previews render each observation's own NDVI, EVI or NDMI GeoTIFF, using a fixed linear -1 to +1 display range (blue `#313695` at -1, pale yellow `#ffffbf` at 0, green `#006837` at +1); values outside the range are clipped for display only. Invalid and masked pixels are transparent. Those source rasters mask to the mapped river centerline, not a surrounding land area, so most of a rectangular preview can legitimately be transparent. The map PNG is reprojected with nearest-neighbour sampling to Web Mercator and its WGS84 bounds are reported with the observation. Thumbnail requests use `overview=true` to reproject to at most 256 pixels on the longest side and average valid source values per output cell; empty cells remain transparent. The coloured footprint of a thumbnail cell is not a measurement of valid area. The PNG endpoint reads the GeoTIFF on each request; legacy saved PNGs are not used by it. Source rasters and statistics are not changed by rendering. The new Forest zone-analysis overlay is instead generated from source COG windows as described below.
 
-For the locally inspected Kaveri observation `S2C_MSIL2A_20261113T051041_R019_T43PHP_20261113T100104`, the catalog describes a 504 × 2,616 grid with 1,526 valid NDVI pixels, while the current GeoTIFFs have a 5,490 × 5,276 grid with 1,519 valid pixels. Their file modification times are later than the catalog's processing time. The catalog and files therefore describe different processing outputs; why the files were replaced and their processing version cannot be established from the available evidence. When a stored grid differs from the GeoTIFF grid, the observation API computes statistics from the current rasters, retains the original catalog metadata in `raster_reconciliation`, and reports their processing provenance and centerline coverage as unavailable. Historical comparison and reference assessment are withheld for such records. Neither the stored catalog nor source raster is modified. The catalog count and coverage percentage refer to NDVI, not necessarily EVI or NDMI.
+#### Agriculture GeoTIFF download and coverage checks
 
-River-distance analysis at 0–100 m, 100–500 m and 500–1,000 m is unavailable: the existing index outputs contain mapped-centerline pixels rather than valid surrounding-zone observations, and no suitable local tree-cover reference is integrated. ESA WorldCover tree cover includes plantations, uses Sentinel-2 and predates these 2026 scenes; it cannot establish natural forest or independently validate these indices. GFAM-N/P is a potential natural/planted forest context source, but local coverage, class definitions, temporal compatibility and independent review have not been established.
+The Agriculture download buttons fetch the same NDVI/EVI/NDMI GeoTIFFs used by the index analysis, and validate the response file type, TIFF signature and product-specific filename before saving. `GET /api/sentinel2/{river_id}/{item_id}/{index_name}/tif` verifies that all three index rasters are readable, share an aligned grid, use one Float32 band and NoData `-9999`, and contain valid pixels. When the catalog affine transform is missing in an older record, the endpoint can rely on the aligned GeoTIFF georeferencing and matching catalog CRS/dimensions; it reports this with `X-Raster-Catalog-Georeferencing: reconciled-from-geotiff`. A populated but stale transform or a catalog/raster grid mismatch is not accepted. Missing files, corrupt/incompatible products and outputs with no valid pixels return an explicit 404/409 rather than a success-shaped empty download. Response headers report valid-pixel counts and coverage. Workspace reports show the centerline and raster denominators separately.
+
+Cached audit results: 15 NDVI/EVI/NDMI downloads across five compatible observations matched their local analysis files byte-for-byte and reopened with Rasterio. Their rectangular-grid valid fractions ranged from 0.071069% to 0.833680%. These outputs are centerline-clipped; the fractions are not broad-area Agriculture coverage. The Kaveri T43PHP observation has a catalog/raster dimension mismatch, so its three downloads are withheld and the UI reports the mismatch. No source refresh or raster regeneration was performed during this audit.
+
+### Cached-data presentation walkthrough
+
+This sequence uses persisted local data only; do not press **Refresh and
+reprocess from source** or enable automatic acquisition during a demo.
+
+1. Start the backend and Vite frontend as described above; open the
+   **Overview** and explain that the catalog reports locally recorded
+   acquisition products, not a live provider connection.
+2. Select Kaveri or Tungabhadra on the map, then open **GIS Explorer**. Toggle
+   available local layers, inspect a pixel/feature, and point out unavailable
+   river banks, flood/inundation, administrative boundaries and tree-cover
+   reference layers.
+3. Open **Agriculture** and show a cached Sentinel-2 index preview and its
+   NDVI/EVI/NDMI download controls. Explain both centerline and rectangular
+   grid coverage; identify the T43PHP mismatch as withheld, not a valid
+   download.
+4. Open **Forest Monitoring** and show the persisted 2026-11-13 tile analyses
+   and zone summaries. State that only one acquisition time is present and
+   WorldCover is not imported; do not claim tree-cover area, forest loss, or
+   water/vegetation causation.
+5. Open **AI Analysis** and select a persisted product. Describe the response
+   as deterministic, sourced from stored measurements, and limited by the
+   selected product's evidence; it is not an external LLM conclusion.
+6. Close with the explicit status: candidate SAR classifications are not
+   independently validated; full-corridor monitoring and multi-date
+   vegetation change are not established.
+
+The reported `ndvi.tif` was not corrupt: its 4,503 × 794 rectangle contains 3,575,382 cells, but the raster is intentionally clipped to the mapped river centerline. Before reprocessing it contained 4,585 valid pixels (0.128% of the rectangle, but 97.55% of 4,700 mapped centerline pixels). The producer was also accepting Sentinel-2 SCL water (class 6) and unclassified (class 7) as vegetation. Processor `sentinel2-indices-1.5` now accepts only SCL classes 4 (vegetation) and 5 (not vegetated), excludes water/cloud/shadow/unclassified classes and invalid source masks, and reads reflectance validity in a bounded window. B04/B08 are aligned to the B11 20 m grid with bilinear resampling; reflectance bands are scaled by 0.0001. An explicit “Refresh and reprocess from source” action is required to rediscover/reprocess source observations; it does not run automatically.
+
+The regenerated Kaveri product `S2C_MSIL2A_20261113T051041_R019_T44PKT_20261113T100104` was acquired 2026-11-13T05:10:41.025Z in EPSG:32644. Each index now has 2,541 valid pixels: 54.0638% of mapped centerline pixels and 0.071069% of the rectangular grid. SCL classes on the centerline include 1,530 water and 514 unclassified pixels; those excluded source observations were not filled or synthesized. NDVI valid values range from -0.09330 to 0.57866. The resulting 0.071% rectangle coverage is still expected for a centerline-clipped raster, not an area-wide Agriculture product. No Agriculture parcel/polygon or bank-to-bank study area is defined, so these percentages do not establish coverage of surrounding fields or a full river corridor.
+
+The Forest monitoring workspace now also runs a persisted `forest_analysis` job against the original Sentinel-2 L2A COG assets, rather than reusing the centerline-clipped index rasters. `POST /api/forest/analyses` accepts a river, a locally catalogued item, and 1–6 increasing zone outer distances (1–5,000 m; defaults 500, 1,000, 3,000, 5,000 m). Poll the existing `GET /api/acquisition-jobs/{job_id}` endpoint; completed jobs link to a JSON evidence report, GeoJSON zones, CSV statistics, three GeoTIFFs, and PNG previews. `GET /api/forest/observations` lists local optical records without triggering discovery; `GET /api/forest/references` reports reference metadata and integration status. The new outputs are written under `backend/app/data/forest_monitoring/` and are registered in the existing SQLite satellite catalog.
+
+The worker reads bounded COG windows in 512-pixel blocks, with a 12-million-pixel per-item cap and a 256 MB free-space reserve. It aligns B02/B04/B08 to the native 20 m B11 grid using bilinear resampling, uses nearest-neighbour SCL, and retains only SCL classes 4 (vegetation) and 5 (not vegetated). Clouds, shadows, water, snow, unclassified classes, invalid reflectance and NoData are excluded. It records acquisition/product IDs, sanitized asset paths, source footprint, cloud metadata, CRS, affine transform, resolution, mask/resampling parameters, output checksums and valid-data coverage. The raster outputs are per-tile observations, not forest-cover classifications or unique whole-river area totals.
+
+Two representative real items were processed on 2026-11-15 from the 2026-11-13T05:10:41.025Z Sentinel-2 acquisition: Kaveri `S2C_MSIL2A_20261113T051041_R019_T44PKS_20261113T100104` (analysis `cdf6a16f5786d63caf06e505fdad8cb4038fac82ac503b6c5d71693834c12a23`, EPSG:32644, 20 m) and Tungabhadra `S2C_MSIL2A_20261113T051041_R019_T44PKC_20261113T100104` (analysis `8690117ed95aebf732826cc3165047c171e816728aaaa60b5f2023570e051378`, EPSG:32644, 20 m). The four Kaveri zones respectively report raster coverage 96.7%, 87.1%, 56.1%, 50.2%; valid-data coverage 63.5%, 72.4%, 67.0%, 62.3%. Tungabhadra reports raster coverage 94.2%, 86.0%, 73.2%, 62.7%; valid-data coverage 23.7%, 28.7%, 51.3%, 77.0%. These are tile-specific, one-date spectral summaries; vegetation-index means are not tree-cover percentages. Outputs are stored in `backend/app/data/forest_monitoring/cdf6a16f5786d63caf06e505fdad8cb4038fac82ac503b6c5d71693834c12a23-acf763d4/` and `backend/app/data/forest_monitoring/8690117ed95aebf732826cc3165047c171e816728aaaa60b5f2023570e051378-abd2da93/`; superseded processor v1.0/v1.1 outputs were removed. The local catalog has six usable tile outputs across the two rivers but only one distinct processed acquisition time; Kaveri also has one no-usable-pixels record. Tile counts are not unique landscape coverage.
+
+ESA WorldCover 2021 v200 is exposed as metadata only. No WorldCover or other tree-cover pixels were imported or used, so tree-cover area, forest gain/loss, and natural-forest-versus-plantation statistics remain unavailable. WorldCover tree-cover includes plantations, is partly Sentinel-2-derived, and predates these 2026 scenes; it is not independent Sentinel-2 validation. Multi-date vegetation change and river–vegetation association are also unavailable because only one processed optical time exists and the current SAR water candidates have different dates and centerline-only support. The deterministic evidence-summary endpoint is grounded in stored zone statistics and explicitly withholds forest-loss and causal river-effect claims.
+
+A local-only reference workflow is available: `POST /api/forest/references/import`
+accepts a user-supplied single-band uint8 GeoTIFF for ESA WorldCover 2021 v200,
+up to 100 MiB and 80 million source pixels. It validates CRS/NoData/grid
+readability, hashes the content for idempotent storage, and records that source
+identity is user-supplied rather than independently authenticated. It does not
+download imagery. `POST /api/forest/analyses/{analysis_id}/tree-cover-jobs`
+queues bounded (12-million analysis-pixel) per-zone class-10 statistics using
+an EPSG:6933 10 m grid, with valid-data coverage and a class raster/CSV. Raster
+downloads are withheld when there are no recognized valid classes. No actual
+WorldCover pixels are currently imported in the local project data, so no
+real-world tree-cover result is claimed; class 10 includes plantations and
+cannot establish 2026 loss/gain. The evidence summary can include persisted
+reference statistics when a reference ID is supplied.
+
+For the locally inspected Kaveri observation `S2C_MSIL2A_20261113T051041_R019_T43PHP_20261113T100104`, the catalog describes a 504 × 2,616 grid with 1,526 valid NDVI pixels, while the current GeoTIFFs have a 5,490 × 5,276 grid with 1,519 valid pixels. Their file modification times are later than the catalog's processing time. The catalog and files therefore describe different processing outputs; why the files were replaced and their processing version cannot be established from the available evidence. When a stored grid differs from the GeoTIFF grid, the observation API computes statistics from the current rasters, retains the original catalog metadata in `raster_reconciliation`, and reports their processing provenance and centerline coverage as unavailable. Historical comparison, reference assessment and the three index download buttons are withheld for this record. Neither the stored catalog nor source raster is modified. The catalog count and coverage percentage refer to NDVI, not necessarily EVI or NDMI.
+
+The new distance zones are analysis geometries around the OSM centerline, not assumed forest boundaries, banks, or active-channel extents. Raster coverage and valid-data coverage are reported separately for each item and zone. The older `sentinel2` index products and downloads described above remain centerline-masked; only the Forest zone-analysis job reads the original source assets.
 
 ### Vegetation index reference assessments
 

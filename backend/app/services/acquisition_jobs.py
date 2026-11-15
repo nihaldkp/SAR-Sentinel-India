@@ -95,7 +95,9 @@ def _validate_job_request(request: AcquisitionJobCreate) -> None:
     if request.river_id not in {river.id for river in RIVER_CATALOG}:
         raise ValueError(f"Unknown river identifier: {request.river_id}")
     expected_satellite = (
-        "NISAR" if request.job_type.startswith("nisar_") else "SENTINEL-1"
+        "NISAR" if request.job_type.startswith("nisar_")
+        else "SENTINEL-2" if request.job_type in {"forest_analysis", "forest_tree_cover"}
+        else "SENTINEL-1"
     )
     if request.satellite != expected_satellite:
         raise ValueError("The satellite does not match the requested job type.")
@@ -110,23 +112,49 @@ def _validate_job_request(request: AcquisitionJobCreate) -> None:
         product, _ = acquisitions._nisar_product_record(request.river_id, request.product_id)
         if product.get("download_status") != "downloaded":
             raise ValueError("NISAR processing requires a downloaded and HDF5-verified product.")
+    elif request.job_type == "forest_analysis":
+        from app.services import sentinel2
+
+        record = next(
+            (
+                item for item in sentinel2._load_catalog()
+                if item.get("river_id") == request.river_id
+                and item.get("item_id") == request.product_id
+            ),
+            None,
+        )
+        if record is None or not isinstance(record.get("assets"), dict):
+            raise FileNotFoundError(
+                f"Sentinel-2 product {request.product_id} is not present in the local optical catalog."
+            )
+        if not all(record["assets"].get(name) for name in ("B02", "B04", "B08", "B11", "SCL")):
+            raise ValueError("Forest analysis requires the five source Sentinel-2 L2A assets.")
+    elif request.job_type == "forest_tree_cover":
+        from app.services import forest_monitoring
+
+        analysis = forest_monitoring.get_analysis(request.product_id)
+        if analysis.get("river_id") != request.river_id:
+            raise ValueError("The forest analysis does not belong to the requested river.")
 
 
 def create_job(
     request: AcquisitionJobCreate,
     retry_of_job_id: str | None = None,
+    parameters: dict[str, Any] | None = None,
 ) -> AcquisitionJob:
     _validate_job_request(request)
     now = _now().isoformat()
     job_id = str(uuid.uuid4())
+    parameters_json = json.dumps(parameters or {}, sort_keys=True, separators=(",", ":"))
     with acquisitions._catalog_connection() as connection:
         try:
             connection.execute(
                 """
                 INSERT INTO acquisition_jobs (
                     job_id, river_id, satellite, product_id, job_type, status,
-                    created_at, progress_percent, current_stage, retry_of_job_id
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, 0, 'Queued', ?)
+                    created_at, progress_percent, current_stage, retry_of_job_id,
+                    parameters_json
+                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, 0, 'Queued', ?, ?)
                 """,
                 (
                     job_id,
@@ -136,6 +164,7 @@ def create_job(
                     request.job_type,
                     now,
                     retry_of_job_id,
+                    parameters_json,
                 ),
             )
             connection.commit()
@@ -153,7 +182,12 @@ def create_job(
 
 
 def retry_job(job_id: str) -> AcquisitionJob:
-    previous = get_job(job_id)
+    with acquisitions._catalog_connection() as connection:
+        previous_row = connection.execute(
+            "SELECT * FROM acquisition_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+    previous = _job_from_row(previous_row) if previous_row else None
     if previous is None:
         raise FileNotFoundError(f"Acquisition job {job_id} was not found.")
     if previous.status != "failed":
@@ -164,7 +198,8 @@ def retry_job(job_id: str) -> AcquisitionJob:
         product_id=previous.product_id,
         job_type=previous.job_type,
     )
-    return create_job(request, retry_of_job_id=previous.job_id)
+    parameters = json.loads(previous_row["parameters_json"] or "{}")
+    return create_job(request, retry_of_job_id=previous.job_id, parameters=parameters)
 
 
 def cancel_job(job_id: str) -> AcquisitionJob:
@@ -386,6 +421,71 @@ def _run_sentinel1_acquisition(job: AcquisitionJob) -> tuple[str, dict[str, str]
     }
 
 
+def _run_forest_analysis(
+    job: AcquisitionJob,
+    parameters: dict[str, Any],
+) -> tuple[str, dict[str, str]]:
+    from app.services import forest_monitoring
+
+    _update_job(
+        job.job_id,
+        status="processing",
+        stage="Reading bounded Sentinel-2 L2A corridor windows",
+        started=True,
+    )
+    result = forest_monitoring.process_item(
+        job.river_id,
+        job.product_id,
+        parameters.get("zone_distances_m"),
+    )
+    references = {
+        "analysis": f"/api/forest/analyses/{result['analysis_id']}",
+        "zones": f"/api/forest/analyses/{result['analysis_id']}/zones.geojson",
+        "statistics": f"/api/forest/analyses/{result['analysis_id']}/stats.csv",
+    }
+    if result["status"] == "completed":
+        references.update({
+            index: f"/api/forest/analyses/{result['analysis_id']}/indices/{index}.tif"
+            for index in ("ndvi", "evi", "ndmi")
+        })
+        return "completed", references
+    return "no_data", references
+
+
+def _run_forest_tree_cover(
+    job: AcquisitionJob,
+    parameters: dict[str, Any],
+) -> tuple[str, dict[str, str]]:
+    from app.services import forest_monitoring
+
+    reference_id = parameters.get("reference_id")
+    if not isinstance(reference_id, str):
+        raise ValueError("A valid imported forest reference is required.")
+    _update_job(
+        job.job_id,
+        status="processing",
+        stage="Calculating tree-cover statistics on common zone support",
+        started=True,
+    )
+    result = forest_monitoring.calculate_tree_cover_statistics(
+        job.product_id,
+        reference_id,
+    )
+    references = {
+        "tree_cover_statistics": (
+            f"/api/forest/analyses/{job.product_id}/tree-cover/{reference_id}"
+        ),
+        "tree_cover_statistics_csv": (
+            f"/api/forest/analyses/{job.product_id}/tree-cover/{reference_id}/stats.csv"
+        ),
+    }
+    if result["status"] == "completed":
+        references["tree_cover_raster"] = (
+            f"/api/forest/analyses/{job.product_id}/tree-cover/{reference_id}/tree-cover.tif"
+        )
+    return ("completed" if result["status"] == "completed" else "no_data"), references
+
+
 def _execute(job_id: str) -> None:
     with acquisitions._catalog_connection() as connection:
         row = connection.execute(
@@ -394,6 +494,7 @@ def _execute(job_id: str) -> None:
         ).fetchone()
         if row is None:
             return
+        parameters = json.loads(row["parameters_json"] or "{}")
         claimed = connection.execute(
             """
             UPDATE acquisition_jobs
@@ -416,9 +517,20 @@ def _execute(job_id: str) -> None:
             final_status = "completed"
         elif job.job_type == "nisar_processing":
             final_status, references = _run_nisar_processing(job)
+        elif job.job_type == "forest_analysis":
+            final_status, references = _run_forest_analysis(job, parameters)
+        elif job.job_type == "forest_tree_cover":
+            final_status, references = _run_forest_tree_cover(job, parameters)
         else:
             final_status, references = _run_sentinel1_acquisition(job)
-        stage = "No valid corridor data; no classification output generated" if final_status == "no_data" else "Completed"
+        stage = "Completed"
+        if final_status == "no_data":
+            if job.job_type == "forest_analysis":
+                stage = "No valid optical pixels; zone geometry and coverage report generated"
+            elif job.job_type == "forest_tree_cover":
+                stage = "No recognized reference classes; coverage report generated and raster withheld"
+            else:
+                stage = "No valid corridor data; no classification output generated"
         _update_job(
             job_id,
             status=final_status,

@@ -50,12 +50,21 @@ def _land_evidence(request: WorkspaceReportRequest) -> dict | None:
         stats = {
             "valid": int(values.size),
             "nodata": int(array.size - values.size),
+            "raster_valid_percent": float(values.size / array.size * 100) if array.size else None,
             "minimum": float(values.min()) if values.size else None,
             "maximum": float(values.max()) if values.size else None,
             "mean": float(values.mean()) if values.size else None,
             "crs": str(dataset.crs) if dataset.crs else None,
             "shape": f"{dataset.width} x {dataset.height}",
         }
+    corridor_pixel_count = record.get("corridor_pixel_count")
+    stats["valid_centerline_percent"] = (
+        float(stats["valid"] / corridor_pixel_count * 100)
+        if not record.get("raster_reconciliation")
+        and isinstance(corridor_pixel_count, int)
+        and corridor_pixel_count > 0
+        else None
+    )
     assessments = vegetation_validation.list_assessments(request.vegetation_river_id or "")
     domain = "agriculture" if request.workspace == "Agriculture" else "forest"
     assessment = next(
@@ -223,10 +232,13 @@ def build_workspace_report(request: WorkspaceReportRequest) -> tuple[BytesIO, st
                    ["Cloud cover", _value(record.get("cloud_cover_percent"), "%")],
                    ["Grid / CRS / resolution", f"{stats['shape']} / {_value(stats['crs'])} / {_value(record.get('resolution_m'), ' m')}"],
                    ["Raster valid / NoData pixels", f"{stats['valid']:,} / {stats['nodata']:,}"],
+                   ["Valid percentage of rectangular raster grid", _value(stats["raster_valid_percent"], "%")],
+                   ["Valid percentage of mapped centerline support", _value(stats["valid_centerline_percent"], "%")],
                    ["Raster mean / minimum / maximum", f"{_value(stats['mean'])} / {_value(stats['minimum'])} / {_value(stats['maximum'])}"],
-                   ["Catalog NDVI valid count", _value(record.get("valid_pixel_count"))],
-                   ["Valid centerline coverage", _value(record.get("valid_pixel_percent"), "%")]],
+                   ["Catalogued NDVI valid pixels", _value(record.get("valid_pixel_count"))],
+                   ["Mapped centerline support pixels", _value(record.get("corridor_pixel_count"))]],
                   [70*mm, 104*mm])
+            paragraph("Raster-grid coverage uses all cells in the rectangular GeoTIFF extent as its denominator. Centerline coverage uses mapped centerline pixels only; the low raster-grid percentage can be expected because the saved product is centerline-clipped, not a full-area land-monitoring raster.")
             if record.get("raster_reconciliation"):
                 metadata = record["raster_reconciliation"]["catalog_metadata"]
                 paragraph(f"Catalog grid mismatch: stored grid {_value(metadata.get('width'))} x {_value(metadata.get('height'))} and NDVI count {_value(metadata.get('valid_pixel_count'))}; current grid {stats['shape']} and NDVI count {_value(record.get('valid_pixel_count'))}. Current raster processing provenance and centerline coverage are unavailable; original catalog metadata is retained.")

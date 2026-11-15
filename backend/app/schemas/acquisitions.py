@@ -30,6 +30,8 @@ AcquisitionJobType = Literal[
     "nisar_download",
     "nisar_processing",
     "sentinel1_acquisition",
+    "forest_analysis",
+    "forest_tree_cover",
 ]
 
 
@@ -418,7 +420,7 @@ class AcquisitionJobCreate(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     river_id: str
-    satellite: Literal["NISAR", "SENTINEL-1"]
+    satellite: Literal["NISAR", "SENTINEL-1", "SENTINEL-2"]
     product_id: str = Field(min_length=1, max_length=512)
     job_type: AcquisitionJobType
 
@@ -428,7 +430,7 @@ class AcquisitionJob(BaseModel):
 
     job_id: str
     river_id: str
-    satellite: Literal["NISAR", "SENTINEL-1"]
+    satellite: Literal["NISAR", "SENTINEL-1", "SENTINEL-2"]
     product_id: str
     job_type: AcquisitionJobType
     status: AcquisitionJobState

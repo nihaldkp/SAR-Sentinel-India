@@ -26,6 +26,7 @@ from rasterio.io import MemoryFile
 from rasterio.warp import reproject, transform_bounds, transform_geom
 from shapely.geometry import shape
 
+from app.paths import portable_catalog_path
 from app.redaction import redact_sensitive_text
 from app.services.rivers import RIVER_CATALOG
 
@@ -34,8 +35,9 @@ STAC_SEARCH_URL = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 SAS_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token/sentinel-2-l2a"
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data" / "acquisitions" / "sentinel2"
 CATALOG_PATH = DATA_ROOT / "catalog.json"
-PROCESSOR_VERSION = "sentinel2-indices-1.4"
-VALID_SCL_CLASSES = {4, 5, 6, 7}
+PROCESSOR_VERSION = "sentinel2-indices-1.5"
+VALID_SCL_CLASSES = {4, 5}
+OUTPUT_NODATA = -9999.0
 PREVIEW_RENDER_LOCK = threading.Lock()
 
 
@@ -173,6 +175,10 @@ def calculate_indices(
     return result
 
 
+def _scene_classification_mask(scl: np.ndarray, source_valid: np.ndarray) -> np.ndarray:
+    return source_valid & np.isin(scl, list(VALID_SCL_CLASSES))
+
+
 def _read_to_grid(
     dataset: rasterio.DatasetReader,
     target_shape: tuple[int, int],
@@ -192,6 +198,44 @@ def _read_to_grid(
         dst_nodata=0,
     )
     return output
+
+
+def _read_validity_to_grid(
+    dataset: rasterio.DatasetReader,
+    target_shape: tuple[int, int],
+    target_transform,
+    target_crs,
+) -> np.ndarray:
+    if dataset.crs != target_crs:
+        raise ValueError("Sentinel-2 reflectance bands do not share the B11 CRS.")
+    west, south, east, north = rasterio.transform.array_bounds(
+        target_shape[0], target_shape[1], target_transform,
+    )
+    source_window = rasterio.windows.from_bounds(
+        west, south, east, north, transform=dataset.transform,
+    ).round_offsets().round_lengths()
+    try:
+        source_window = source_window.intersection(
+            rasterio.windows.Window(0, 0, dataset.width, dataset.height)
+        )
+    except rasterio.errors.WindowError:
+        return np.zeros(target_shape, dtype=bool)
+    if source_window.width <= 0 or source_window.height <= 0:
+        return np.zeros(target_shape, dtype=bool)
+    source_mask = dataset.read_masks(1, window=source_window)
+    output = np.zeros(target_shape, dtype=np.uint8)
+    reproject(
+        source=source_mask,
+        destination=output,
+        src_transform=dataset.window_transform(source_window),
+        src_crs=dataset.crs,
+        dst_transform=target_transform,
+        dst_crs=target_crs,
+        src_nodata=0,
+        dst_nodata=0,
+        resampling=Resampling.nearest,
+    )
+    return output > 0
 
 
 def _write_index(path: Path, array: np.ndarray, profile: dict[str, Any]) -> None:
@@ -306,25 +350,45 @@ def process_sentinel2_item(record: dict[str, Any]) -> dict[str, Any]:
         )
         target_crs = swir_dataset.crs
         swir = swir_dataset.read(1, window=window, out_shape=(height, width))
+        valid = (
+            (swir_dataset.read_masks(1, window=window, out_shape=(height, width)) > 0)
+            & np.isfinite(swir)
+            & (swir > 0)
+        )
         with rasterio.open(signed["SCL"]) as scl_dataset:
+            if (
+                scl_dataset.crs != swir_dataset.crs
+                or scl_dataset.transform != swir_dataset.transform
+                or (scl_dataset.width, scl_dataset.height) != (swir_dataset.width, swir_dataset.height)
+            ):
+                raise ValueError("Sentinel-2 SCL and B11 rasters do not share the same native grid.")
             scl = scl_dataset.read(
                 1,
                 window=window,
                 out_shape=(height, width),
                 resampling=Resampling.nearest,
             )
+            valid &= scl_dataset.read_masks(
+                1,
+                window=window,
+                out_shape=(height, width),
+                resampling=Resampling.nearest,
+            ) > 0
         corridor_mask = geometry_mask(
             [river_geometry],
             out_shape=(height, width),
             transform=target_transform,
             invert=True,
         )
-        valid = np.isin(scl, list(VALID_SCL_CLASSES))
+        valid = _scene_classification_mask(scl, valid)
         valid &= corridor_mask
         bands: dict[str, np.ndarray] = {}
+        for band_name in ("B02", "B04", "B08"):
+            bands[band_name] = np.zeros((height, width), dtype=np.float32)
         for name in ("B02", "B04", "B08"):
             with rasterio.open(signed[name]) as dataset:
                 bands[name] = _read_to_grid(dataset, (height, width), target_transform, target_crs)
+                valid &= _read_validity_to_grid(dataset, (height, width), target_transform, target_crs)
 
     indices = calculate_indices(bands["B02"], bands["B04"], bands["B08"], swir, valid)
     profile = {
@@ -335,7 +399,7 @@ def process_sentinel2_item(record: dict[str, Any]) -> dict[str, Any]:
         "dtype": "float32",
         "crs": target_crs,
         "transform": target_transform,
-        "nodata": -9999.0,
+        "nodata": OUTPUT_NODATA,
         "compress": "deflate",
     }
     output_paths: dict[str, str] = {}
@@ -344,24 +408,28 @@ def process_sentinel2_item(record: dict[str, Any]) -> dict[str, Any]:
         array = np.where(np.isfinite(array), array, -9999.0)
         path = output_root / f"{name}.tif"
         _write_index(path, array, profile)
-        output_paths[name] = str(path.relative_to(DATA_ROOT.parent.parent))
+        output_paths[name] = path.relative_to(DATA_ROOT.parent.parent).as_posix()
         preview = output_root / f"{name}.png"
         _write_preview(preview, indices[name])
-        preview_paths[name] = str(preview.relative_to(DATA_ROOT.parent.parent))
+        preview_paths[name] = preview.relative_to(DATA_ROOT.parent.parent).as_posix()
 
     with rasterio.open(output_root / "ndvi.tif") as dataset:
         bounds_wgs84 = _wgs84_bounds(dataset)
 
     valid_values = {name: array[np.isfinite(array)] for name, array in indices.items()}
+    valid_pixel_counts = {name: int(values.size) for name, values in valid_values.items()}
     record.update({
         "status": "processed" if valid_values["ndvi"].size else "no_usable_pixels",
         "processor_version": PROCESSOR_VERSION,
         "crs": str(target_crs),
         "resolution_m": abs(float(target_transform.a)),
+        "transform": list(target_transform),
+        "nodata": OUTPUT_NODATA,
         "width": width,
         "height": height,
         "corridor_pixel_count": int(corridor_mask.sum()),
         "valid_pixel_count": int(valid_values["ndvi"].size),
+        "valid_pixel_counts_by_index": valid_pixel_counts,
         "valid_pixel_percent": float(valid_values["ndvi"].size / (int(corridor_mask.sum()) or 1) * 100),
         "raster_pixel_percent": float(valid_values["ndvi"].size / (height * width) * 100),
         "index_statistics": {
@@ -378,7 +446,10 @@ def process_sentinel2_item(record: dict[str, Any]) -> dict[str, Any]:
         "processing_parameters": {
             "reflectance_scale_factor": 0.0001,
             "valid_scl_classes": sorted(VALID_SCL_CLASSES),
-            "cloud_shadow_scl_classes_excluded": [3, 8, 9, 10, 11],
+            "excluded_scl_classes": sorted(set(range(12)) - VALID_SCL_CLASSES),
+            "source_masks_required": True,
+            "scene_classification_resampling": "nearest",
+            "reflectance_resampling": "bilinear to the B11 grid",
             "target_resolution_m": 20,
             "formulas": {
                 "ndvi": "(B08-B04)/(B08+B04)",
@@ -458,8 +529,12 @@ def reconcile_cached_grid(record: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def get_observations(river_id: str, refresh: bool = False, limit: int = 8) -> dict[str, Any]:
+def get_observations(
+    river_id: str, refresh: bool = False, limit: int = 8, *, allow_discovery: bool = True,
+) -> dict[str, Any]:
     records = [record for record in _load_catalog() if record.get("river_id") == river_id]
+    if not allow_discovery and (refresh or not records):
+        raise ValueError("Sentinel-2 discovery is disabled on the public service; cached observations are unavailable.")
     if refresh or not records:
         discovered = discover_sentinel2(river_id, limit=limit)
         existing = {record.get("item_id"): record for record in records}
@@ -588,10 +663,130 @@ def _cached_raster_path(record: dict[str, Any], index_name: str) -> Path:
     relative_path = record.get("output_paths", {}).get(index_name)
     if not isinstance(relative_path, str):
         raise ValueError(f"{index_name.upper()} output is unavailable.")
-    path = (DATA_ROOT.parent.parent / relative_path).resolve()
+    path = (DATA_ROOT.parent.parent / portable_catalog_path(relative_path)).resolve()
     if DATA_ROOT.resolve() not in path.parents or not path.is_file():
         raise ValueError(f"{index_name.upper()} output is unavailable.")
     return path
+
+
+def validate_index_download(
+    river_id: str,
+    item_id: str,
+    index_name: str,
+) -> tuple[Path, dict[str, bool | float | int]]:
+    if index_name not in {"ndvi", "evi", "ndmi"}:
+        raise ValueError("Unsupported Sentinel-2 vegetation index.")
+    record = next(
+        (
+            item for item in _load_catalog()
+            if item.get("river_id") == river_id and item.get("item_id") == item_id
+        ),
+        None,
+    )
+    if record is None:
+        raise FileNotFoundError("Sentinel-2 observation is not in the local catalog.")
+    if record.get("status") != "processed":
+        raise ValueError("The Sentinel-2 observation has no processed raster available.")
+
+    grid = None
+    georeferencing_reconciled = False
+    paths = {}
+    for name in ("ndvi", "evi", "ndmi"):
+        path = _cached_raster_path(record, name)
+        try:
+            with rasterio.open(path) as dataset:
+                if (
+                    dataset.count != 1
+                    or dataset.dtypes != ("float32",)
+                    or dataset.nodata != OUTPUT_NODATA
+                    or dataset.crs is None
+                    or not dataset.crs.is_projected
+                    or dataset.crs.linear_units.casefold() not in {"metre", "meter", "meters", "metres"}
+                ):
+                    raise ValueError(f"{name.upper()} GeoTIFF has invalid band, NoData, or CRS metadata.")
+                actual_transform = tuple(dataset.transform)
+                if (
+                    not all(math.isfinite(value) for value in actual_transform)
+                    or abs(dataset.transform.a * dataset.transform.e - dataset.transform.b * dataset.transform.d) < 1e-12
+                ):
+                    raise ValueError(f"{name.upper()} GeoTIFF has invalid georeferencing.")
+                current_grid = (
+                    dataset.width,
+                    dataset.height,
+                    dataset.crs,
+                    dataset.transform,
+                )
+                if grid is None:
+                    grid = current_grid
+                elif current_grid != grid:
+                    raise ValueError("The NDVI, EVI, and NDMI GeoTIFFs do not share one aligned grid.")
+                if (
+                    record.get("width") != dataset.width
+                    or record.get("height") != dataset.height
+                    or record.get("crs") != dataset.crs.to_string()
+                ):
+                    raise ValueError(f"{name.upper()} GeoTIFF no longer matches its catalogued grid; refresh the observation.")
+                catalog_transform = record.get("transform")
+                if catalog_transform is None:
+                    georeferencing_reconciled = True
+                else:
+                    try:
+                        transform_values = tuple(float(value) for value in catalog_transform)
+                    except (TypeError, ValueError):
+                        transform_values = ()
+                    if (
+                        not isinstance(catalog_transform, (list, tuple))
+                        or len(transform_values) != 9
+                        or not all(math.isfinite(value) for value in transform_values)
+                        or transform_values != tuple(dataset.transform)
+                    ):
+                        raise ValueError(f"{name.upper()} GeoTIFF has stale catalogued transform metadata; refresh the observation.")
+                catalog_bounds = record.get("bounds_wgs84")
+                if not isinstance(catalog_bounds, dict):
+                    if not georeferencing_reconciled:
+                        raise ValueError(f"{name.upper()} GeoTIFF has no catalogued bounds; refresh the observation.")
+                    georeferencing_reconciled = True
+                raster_bounds = _wgs84_bounds(dataset)
+                if isinstance(catalog_bounds, dict):
+                    bounds_match = all(
+                        isinstance(catalog_bounds.get(key), (int, float))
+                        and math.isclose(
+                            float(catalog_bounds[key]),
+                            raster_bounds[key],
+                            rel_tol=1e-9,
+                            abs_tol=1e-9,
+                        )
+                        for key in ("west", "south", "east", "north")
+                    )
+                    if not bounds_match:
+                        if not georeferencing_reconciled:
+                            raise ValueError(f"{name.upper()} GeoTIFF no longer matches its catalogued bounds; refresh the observation.")
+                        georeferencing_reconciled = True
+        except rasterio.errors.RasterioError as error:
+            raise ValueError(f"{name.upper()} GeoTIFF is unreadable or corrupt.") from error
+        paths[name] = path
+
+    path = paths[index_name]
+    valid_pixels = 0
+    with rasterio.open(path) as dataset:
+        for _, window in dataset.block_windows(1):
+            block = dataset.read(1, window=window, masked=True)
+            valid = ~np.ma.getmaskarray(block) & np.isfinite(block.data)
+            valid_pixels += int(valid.sum())
+    if valid_pixels == 0:
+        raise ValueError(f"{index_name.upper()} GeoTIFF contains no valid pixels and cannot be downloaded.")
+    corridor_pixels = record.get("corridor_pixel_count")
+    return path, {
+        "valid_pixels": valid_pixels,
+        "raster_pixels": int(grid[0] * grid[1]),
+        "raster_valid_percent": valid_pixels / (grid[0] * grid[1]) * 100,
+        "catalog_georeferencing_reconciled": georeferencing_reconciled,
+        "valid_centerline_percent": (
+            valid_pixels / corridor_pixels * 100
+            if isinstance(corridor_pixels, int) and corridor_pixels > 0
+            else 0.0
+        ),
+    }
 
 
 def compare_observations(

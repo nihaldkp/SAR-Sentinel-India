@@ -1,5 +1,9 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
+from pathlib import PurePosixPath
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,6 +11,13 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 client = TestClient(app)
+
+
+def test_catalog_paths_are_portable_from_windows_to_linux() -> None:
+    from app.paths import portable_catalog_path
+
+    root = PurePosixPath("/opt/sar-sentinel")
+    assert root / portable_catalog_path(r"data\acquisitions\scene.h5") == root / "data/acquisitions/scene.h5"
 
 
 def test_health_identifies_demonstration_mode() -> None:
@@ -71,6 +82,43 @@ def test_local_frontend_origin_with_vite_fallback_port_is_allowed_by_cors() -> N
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5175"
+
+
+def test_configured_production_origin_is_allowed_and_other_origins_are_not() -> None:
+    script = """
+from fastapi.testclient import TestClient
+from app.main import app
+client = TestClient(app)
+for origin in ('https://demo.pages.dev', 'https://other.pages.dev'):
+    response = client.options('/api/health', headers={'Origin': origin, 'Access-Control-Request-Method': 'GET'})
+    print(response.headers.get('access-control-allow-origin', 'denied'))
+"""
+    environment = {**os.environ, "SAR_CORS_ORIGINS": "https://demo.pages.dev"}
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=environment, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.splitlines() == ["https://demo.pages.dev", "denied"]
+
+
+def test_public_service_blocks_mutations_but_allows_reports_and_reads(monkeypatch) -> None:
+    monkeypatch.setattr(app.state, "public_read_only", True)
+    assert client.get("/api/health").status_code == 200
+    assert client.post("/api/reports/workspace", json={}).status_code == 422
+    assert client.post("/api/sentinel2/comparisons", json={}).status_code == 422
+    assert client.post("/api/analysis/ai-summary", json={}).status_code == 422
+    assert client.post("/api/acquisition-jobs", json={}).status_code == 403
+    for query in ("refresh=true", "%72efresh=true", "refresh=false&refresh=true"):
+        assert client.get(f"/api/sentinel2/observations?river_id=kaveri&{query}").status_code == 403
+
+
+def test_public_service_does_not_discover_when_cache_is_missing(monkeypatch) -> None:
+    from app.services import sentinel2
+
+    monkeypatch.setattr(app.state, "public_read_only", True)
+    monkeypatch.setattr(sentinel2, "_load_catalog", lambda: [])
+    response = client.get("/api/sentinel2/observations?river_id=kaveri&refresh=false")
+    assert response.status_code == 503
+    assert "discovery is disabled" in response.json()["detail"]
 
 
 def test_rivers_are_exposed_with_real_centerline_geometry() -> None:

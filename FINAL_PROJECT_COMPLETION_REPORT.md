@@ -1,10 +1,55 @@
 # SAR Sentinel India — Project Completion Report
 
-**Report date:** 2026-11-10
+**Report date:** 2026-11-15
 
 **Workspace:** `D:\SAR-Sentinel-India`
 
 **Overall status:** Software delivery for the implemented, currently available workflows is verified. Scientific validation and several data-dependent analyses remain incomplete; this is not a claim of scientific completion.
+
+## 2026-11-15 — presentation audit addendum
+
+**Presentation status:** Ready for a cached-data demonstration with explicit
+limitations; not ready to claim full-corridor monitoring, scientific
+validation, or forest-change detection.
+
+- GIS Explorer is implemented against local project data: 69 layers available
+  and 4 layer types explicitly unavailable. Previews are EPSG:3857 display
+  products; native raster downloads preserve their source CRS and grid.
+- Agriculture NDVI/EVI/NDMI download verification covered 15 advertised
+  downloads from five cached observations. Every response matched its local
+  analysis GeoTIFF byte-for-byte and reopened with Rasterio as Float32,
+  single-band, NoData `-9999`, with nonzero valid pixels. Rectangular-grid
+  valid fractions ranged from **0.071069% to 0.833680%** because these are
+  centerline-clipped rasters, not area-wide agricultural products.
+- The three index downloads for Kaveri T43PHP are withheld because the raster
+  dimensions disagree with the catalog. The UI displays the mismatch; no
+  files were regenerated. Older catalog rows lacking affine transforms use
+  validated GeoTIFF metadata for downloads and return an explicit
+  `X-Raster-Catalog-Georeferencing` response header. This is not a repair of
+  the catalog or independent verification of source provenance.
+- Forest outputs remain two partial Sentinel-2 tile analyses on one date.
+  WorldCover is metadata/import workflow only; no reference pixels are
+  currently available. Forest/tree-cover area, temporal vegetation change,
+  and river–vegetation relationships remain unsupported.
+- NISAR/Sentinel-1 classifications remain candidates without independent
+  accuracy validation. AI summaries are deterministic and evidence-grounded,
+  not model-generated predictions.
+
+Only cached local data were used; automatic acquisition was disabled and no
+satellite products were downloaded or reprocessed for this audit. No
+scientific completion or additional checklist completion is claimed. Final
+verification results and the presentation walkthrough are recorded below and
+in [README.md](./README.md).
+
+Final verification: backend **272 passed, 3 skipped**; Python `compileall`,
+`pip check`, frontend production build, `npm ls --depth=0`, and
+`git diff --check` passed. Full Playwright: **37 passed**. The build reports
+one 528.30 kB JavaScript chunk above Vite's 500 kB advisory threshold.
+Backend warnings include the existing Starlette/httpx deprecation and
+Rasterio synthetic-fixture georeferencing notices. The skipped tests require
+opt-in live Earthdata credentials/download or Windows symlink privileges.
+Automatic acquisition remained disabled; API/browser validation used cached
+or mocked data as appropriate.
 
 ## Latest continuation — national coverage not completed
 

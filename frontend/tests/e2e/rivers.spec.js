@@ -222,6 +222,27 @@ test.beforeEach(async ({ page }) => {
 
 test("page exports download selected workspace reports without candidate analysis", async ({ page }) => {
   const requests = [];
+  const forestObservation = {
+    item_id: "S2_TEST",
+    acquisition_datetime: "2026-11-13T05:10:41Z",
+    status: "processed",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    has_source_assets: true,
+  };
+  await page.route("**/api/forest/observations**", (route) => route.fulfill({ json: {
+    river_id: "kaveri",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    observations: [forestObservation],
+    distinct_processed_acquisition_times: [forestObservation.acquisition_datetime],
+    temporal_change_status: "insufficient_observations",
+    limitations: [],
+  } }));
+  await page.route("**/api/forest/references", (route) => route.fulfill({ json: {
+    references: [],
+    tree_cover_statistics_status: "not_available",
+  } }));
   await page.route("**/api/sentinel2/observations**", async (route) => {
     const riverId = new URL(route.request().url()).searchParams.get("river_id");
     await route.fulfill({ json: {
@@ -256,8 +277,11 @@ test("page exports download selected workspace reports without candidate analysi
   await page.getByRole("combobox", { name: "Select river" }).selectOption("kaveri");
   for (const workspace of ["Overview", "Map explorer", "Change analysis", "Impact explorer", "Agriculture", "Forest monitoring"]) {
     await page.getByRole("button", { name: workspace, exact: true }).click();
-    if (workspace === "Agriculture" || workspace === "Forest monitoring") {
+    if (workspace === "Agriculture") {
       await page.getByLabel("Index").selectOption("ndmi");
+    } else if (workspace === "Forest monitoring") {
+      await page.getByLabel("Index layer").selectOption("ndmi");
+      await page.locator(".sentinel2-map-controls select").selectOption("ndmi");
     }
     const exportButton = page.getByRole("button", { name: "Export", exact: true });
     await expect(exportButton).toBeEnabled();
@@ -1562,7 +1586,7 @@ test("NISAR connection summary displays recorded authenticated product access", 
   await expect(summary.getByText(/10 Nov 2026/).first()).toBeVisible();
 });
 
-test("agriculture and forest pages disclose unavailable vegetation indicators", async ({ page }) => {
+test("agriculture retains its existing unavailable-data state and forest reports missing scenes", async ({ page }) => {
   await page.route("**/api/sentinel2/observations**", async (route) => {
     const riverId = new URL(route.request().url()).searchParams.get("river_id");
     await route.fulfill({ json: {
@@ -1570,6 +1594,19 @@ test("agriculture and forest pages disclose unavailable vegetation indicators", 
       collection: "sentinel-2-l2a", observations: [], limitations: [],
     } });
   });
+  await page.route("**/api/forest/observations**", (route) => route.fulfill({ json: {
+    river_id: "kaveri",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    observations: [],
+    distinct_processed_acquisition_times: [],
+    temporal_change_status: "insufficient_observations",
+    limitations: [],
+  } }));
+  await page.route("**/api/forest/references", (route) => route.fulfill({ json: {
+    references: [],
+    tree_cover_statistics_status: "not_available",
+  } }));
   await page.getByRole("button", { name: "Agriculture" }).click();
   await expect(page.getByRole("heading", { name: "Agriculture monitoring" })).toBeVisible();
   await expect(page.getByText("Vegetation indicators are not available")).toBeVisible();
@@ -1577,14 +1614,327 @@ test("agriculture and forest pages disclose unavailable vegetation indicators", 
 
   await page.getByRole("button", { name: "Forest monitoring" }).click();
   await expect(page.getByRole("region", { name: "Forest monitoring" }).getByRole("heading", { name: "Forest monitoring" })).toBeVisible();
-  await expect(page.getByText("No forest index available")).toBeVisible();
-  await expect(page.getByText(/River-distance zones/)).toContainText("centerline");
-  await expect(page.getByText(/deforestation, or agricultural statistics/)).toBeVisible();
+  await expect(page.getByText("No Sentinel-2 L2A source assets are available for this river in the local catalog.")).toBeVisible();
+  await expect(page.getByText(/Only 0 distinct processed Sentinel-2 acquisition time/)).toBeVisible();
+});
+
+test("forest workspace generates zone statistics, maps, evidence summary, and actual downloads", async ({ page }) => {
+  const analysisId = "a".repeat(64);
+  const referenceId = "b".repeat(64);
+  let uploadedReference = null;
+  const zones = ["0-500m", "500-1000m", "1000-3000m", "3000-5000m"].map((zoneId, index) => ({
+    zone_id: zoneId,
+    inner_distance_m: [0, 500, 1000, 3000][index],
+    outer_distance_m: [500, 1000, 3000, 5000][index],
+    zone_area_km2: 2 + index,
+    raster_covered_area_km2: 1.8 + index,
+    valid_area_km2: 1.4 + index,
+    raster_coverage_percent: 90,
+    valid_data_coverage_percent: 75,
+    clear_scl_pixel_count: 1000,
+    valid_pixel_count: 750,
+    scl_masked_pixel_count: 200,
+    ndvi: { valid_pixel_count: 750, mean: 0.62 - index * 0.04, standard_deviation: 0.12, minimum: 0.1, maximum: 0.9 },
+    evi: { valid_pixel_count: 750, mean: 0.48 - index * 0.03, standard_deviation: 0.1, minimum: 0.1, maximum: 0.8 },
+    ndmi: { valid_pixel_count: 750, mean: 0.32 - index * 0.02, standard_deviation: 0.11, minimum: -0.1, maximum: 0.7 },
+  }));
+  const analysis = {
+    schema_version: 1,
+    analysis_id: analysisId,
+    status: "completed",
+    river_id: "kaveri",
+    item_id: "KAVERI-S2-TILE",
+    acquisition_datetime: "2026-11-13T05:10:41Z",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    stac_item_url: "https://planetarycomputer.microsoft.com/api/stac/v1/items/KAVERI-S2-TILE",
+    asset_sources: {},
+    generated_at: "2026-11-15T12:00:00Z",
+    processor_version: "forest-s2-zones-1.3",
+    processing_parameters: { zone_distances_m: [500, 1000, 3000, 5000] },
+    grid: {
+      crs: "EPSG:32643",
+      resolution_m: 20,
+      width: 100,
+      height: 100,
+      bounds_wgs84: { west: 75.9, south: 12.4, east: 76.1, north: 12.6 },
+    },
+    zones,
+    tree_cover: { status: "not_available" },
+    temporal_change: { status: "insufficient_observations" },
+    river_vegetation_relationship: { status: "insufficient_temporal_overlap" },
+    uncertainty_and_limitations: ["Indices are not tree-cover measurements.", "Only one acquisition date is available."],
+    output_sha256: {},
+  };
+  await page.route("**/api/sentinel2/observations**", (route) => {
+    const riverId = new URL(route.request().url()).searchParams.get("river_id");
+    const observation = {
+      river_id: riverId,
+      item_id: analysis.item_id,
+      acquisition_datetime: analysis.acquisition_datetime,
+      status: "processed",
+      source: "Microsoft Planetary Computer",
+      collection: "sentinel-2-l2a",
+      valid_pixel_count: 1000,
+      valid_pixel_percent: 75,
+      resolution_m: 20,
+      crs: "EPSG:32643",
+      bounds_wgs84: analysis.grid.bounds_wgs84,
+      index_statistics: {},
+      vegetation_validation: {},
+      limitations: ["Centerline index."],
+    };
+    return route.fulfill({
+      json: {
+        river_id: riverId,
+        source: "Microsoft Planetary Computer",
+        collection: "sentinel-2-l2a",
+        observations: [observation],
+        historical_comparisons: [],
+        limitations: [],
+      },
+    });
+  });
+  await page.route("**/api/sentinel2/*/*/*/png?**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.route("**/api/forest/observations**", (route) => route.fulfill({ json: {
+    river_id: "kaveri",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    observations: [{
+      item_id: analysis.item_id,
+      acquisition_datetime: analysis.acquisition_datetime,
+      status: "processed",
+      source: "Microsoft Planetary Computer",
+      collection: "sentinel-2-l2a",
+      crs: "EPSG:32643",
+      resolution_m: 20,
+      valid_pixel_count: 1000,
+      bounds_wgs84: analysis.grid.bounds_wgs84,
+      has_source_assets: true,
+    }],
+    distinct_processed_acquisition_times: [analysis.acquisition_datetime],
+    temporal_change_status: "insufficient_observations",
+    limitations: [],
+  } }));
+  await page.route("**/api/forest/references", (route) => route.fulfill({ json: {
+    references: [
+      { id: "esa-worldcover-2021-v200", name: "ESA WorldCover 2021 v200", status: "metadata_only_not_integrated" },
+      ...(uploadedReference ? [uploadedReference] : []),
+    ],
+    tree_cover_statistics_status: uploadedReference ? "available_after_import" : "not_available",
+  } }));
+  await page.route("**/api/forest/references/import", async (route) => {
+    uploadedReference = {
+      reference_id: referenceId,
+      dataset_id: "esa-worldcover-2021-v200",
+      name: "ESA WorldCover 2021 v200",
+      status: "pixels_imported",
+      source_sha256: "c".repeat(64),
+    };
+    await route.fulfill({ status: 201, json: uploadedReference });
+  });
+  await page.route("**/api/forest/analyses", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    const body = route.request().postDataJSON();
+    expect(body.zone_distances_m).toEqual([500, 1000, 3000, 5000]);
+    await route.fulfill({ status: 202, json: {
+      job_id: "forest-job",
+      river_id: "kaveri",
+      satellite: "SENTINEL-2",
+      product_id: analysis.item_id,
+      job_type: "forest_analysis",
+      status: "queued",
+      created_at: "2026-11-15T12:00:00Z",
+      current_stage: "Queued",
+      output_references: {},
+    } });
+  });
+  await page.route("**/api/acquisition-jobs/forest-job", (route) => route.fulfill({ json: {
+    job_id: "forest-job",
+    river_id: "kaveri",
+    satellite: "SENTINEL-2",
+    product_id: analysis.item_id,
+    job_type: "forest_analysis",
+    status: "completed",
+    created_at: "2026-11-15T12:00:00Z",
+    completed_at: "2026-11-15T12:00:10Z",
+    current_stage: "Completed",
+    output_references: { analysis: `/api/forest/analyses/${analysisId}` },
+  } }));
+  await page.route("**/api/forest/analyses/*/tree-cover-jobs", (route) => route.fulfill({ status: 202, json: {
+    job_id: "forest-tree-cover-job",
+    river_id: "kaveri",
+    satellite: "SENTINEL-2",
+    product_id: analysisId,
+    job_type: "forest_tree_cover",
+    status: "queued",
+    created_at: "2026-11-15T12:00:00Z",
+    current_stage: "Queued",
+    output_references: {},
+  } }));
+  await page.route("**/api/acquisition-jobs/forest-tree-cover-job", (route) => route.fulfill({ json: {
+    job_id: "forest-tree-cover-job",
+    river_id: "kaveri",
+    satellite: "SENTINEL-2",
+    product_id: analysisId,
+    job_type: "forest_tree_cover",
+    status: "completed",
+    created_at: "2026-11-15T12:00:00Z",
+    completed_at: "2026-11-15T12:00:10Z",
+    current_stage: "Completed",
+    output_references: {},
+  } }));
+  await page.route(`**/api/forest/analyses/${analysisId}**`, async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname.endsWith("/tree-cover-jobs")) {
+      await route.fallback();
+    } else if (pathname.endsWith(`/tree-cover/${referenceId}`)) {
+      await route.fulfill({ json: {
+        analysis_id: analysisId,
+        reference_id: referenceId,
+        dataset_name: "ESA WorldCover 2021 v200",
+        reference_year: 2021,
+        status: "completed",
+        zones: [{
+          zone_id: "0-500m",
+          tree_cover_area_km2: 1.25,
+          tree_cover_percent_of_valid_area: 40,
+          valid_data_coverage_percent: 75,
+        }],
+        output: {
+          bounds_wgs84: { west: 75.9, south: 12.4, east: 76.1, north: 12.6 },
+        },
+        limitations: ["Tree cover includes plantations."],
+      } });
+    } else if (pathname.endsWith("/zones.geojson")) {
+      await route.fulfill({ json: {
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          properties: { zone_id: "0-500m" },
+          geometry: { type: "Polygon", coordinates: [[[75.9, 12.4], [76.1, 12.4], [76.1, 12.6], [75.9, 12.6], [75.9, 12.4]]] },
+        }],
+      } });
+    } else if (pathname.endsWith("/evidence-summary")) {
+      await route.fulfill({ json: {
+        analysis_id: analysisId,
+        generated_at: "2026-11-15T12:00:00Z",
+        analysis_mode: "deterministic_evidence_summary",
+        river_id: "kaveri",
+        item_id: analysis.item_id,
+        acquisition_datetime: analysis.acquisition_datetime,
+        observed_zone_summaries: ["0-500m: NDVI mean 0.620; 75.0% valid-data coverage."],
+        limitations: analysis.uncertainty_and_limitations,
+        conclusion: "Observed values do not establish forest loss or a river effect.",
+      } });
+    } else if (pathname.includes("/preview/") || pathname.endsWith("/preview.png")) {
+      await route.fulfill({
+        contentType: "image/png",
+        body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+      });
+    } else {
+      await route.fulfill({ json: analysis });
+    }
+  });
+  await page.route("https://*.tile.openstreetmap.org/**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.getByRole("button", { name: "Forest monitoring" }).click();
+
+  await expect(page.getByLabel("Forest observation date")).toHaveValue(analysis.item_id);
+  await expect(page.getByRole("region", { name: "Temporal comparison availability" })).toContainText("Only 1 distinct processed Sentinel-2");
+  await page.getByRole("button", { name: "Run zone analysis" }).click();
+  const statistics = page.getByRole("region", { name: "Forest vegetation statistics" });
+  await expect(statistics.getByText("Observed vegetation-index statistics")).toBeVisible();
+  await expect(statistics.getByText("0-500m").first()).toBeVisible();
+  await expect(statistics.getByRole("link", { name: "NDVI GeoTIFF" })).toHaveAttribute("href", new RegExp(`/api/forest/analyses/${analysisId}/indices/ndvi.tif$`));
+  await expect(page.getByRole("region", { name: "Forest zone map" })).toBeVisible();
+  await page.getByRole("button", { name: "Generate evidence summary" }).click();
+  await expect(page.getByText("Observed values do not establish forest loss or a river effect.")).toBeVisible();
+  await page.getByLabel("ESA WorldCover GeoTIFF").setInputFiles({
+    name: "worldcover.tif",
+    mimeType: "image/tiff",
+    buffer: Buffer.from("synthetic-worldcover-upload"),
+  });
+  await page.getByRole("button", { name: "Import reference pixels" }).click();
+  await expect(page.getByLabel("Imported forest reference")).toHaveValue(referenceId);
+  await page.getByRole("button", { name: "Calculate tree-cover statistics" }).click();
+  const referenceStatistics = page.getByRole("region", { name: "Tree-cover reference statistics" });
+  await expect(referenceStatistics).toContainText("1.250");
+  await expect(page.getByLabel("Show imported tree-cover reference layer")).toBeChecked();
+  await expect(referenceStatistics.getByRole("link", { name: "Tree-cover class GeoTIFF" }))
+    .toHaveAttribute("href", new RegExp(`/tree-cover/${referenceId}/tree-cover.tif$`));
+});
+
+test("forest workspace displays failed analysis jobs without showing results", async ({ page }) => {
+  const observation = {
+    item_id: "S2_FAILURE_FIXTURE",
+    acquisition_datetime: "2026-11-13T05:10:41Z",
+    status: "processed",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    has_source_assets: true,
+  };
+  await page.route("**/api/forest/observations**", (route) => route.fulfill({ json: {
+    river_id: "kaveri",
+    source: "Microsoft Planetary Computer",
+    collection: "sentinel-2-l2a",
+    observations: [observation],
+    distinct_processed_acquisition_times: [observation.acquisition_datetime],
+    temporal_change_status: "insufficient_observations",
+    limitations: [],
+  } }));
+  await page.route("**/api/forest/references", (route) => route.fulfill({ json: {
+    references: [],
+    tree_cover_statistics_status: "not_available",
+  } }));
+  await page.route("**/api/forest/analyses", async (route) => {
+    if (route.request().method() === "POST") {
+      await route.fulfill({ status: 202, json: {
+        job_id: "forest-failed-job",
+        river_id: "kaveri",
+        satellite: "SENTINEL-2",
+        product_id: observation.item_id,
+        job_type: "forest_analysis",
+        status: "queued",
+        created_at: "2026-11-15T12:00:00Z",
+        current_stage: "Queued",
+        output_references: {},
+      } });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route("**/api/acquisition-jobs/forest-failed-job", (route) => route.fulfill({ json: {
+    job_id: "forest-failed-job",
+    river_id: "kaveri",
+    satellite: "SENTINEL-2",
+    product_id: observation.item_id,
+    job_type: "forest_analysis",
+    status: "failed",
+    created_at: "2026-11-15T12:00:00Z",
+    completed_at: "2026-11-15T12:00:01Z",
+    current_stage: "Failed",
+    error_message: "Injected forest processing failure",
+    output_references: {},
+  } }));
+
+  await page.getByRole("button", { name: "Forest monitoring" }).click();
+  await expect(page.getByLabel("Forest observation date")).toHaveValue(observation.item_id);
+  await page.getByRole("button", { name: "Run zone analysis" }).click();
+  await expect(page.getByRole("alert")).toContainText("Injected forest processing failure");
+  await expect(page.getByRole("region", { name: "Forest vegetation statistics" })).toHaveCount(0);
 });
 
 test("agriculture displays processed Sentinel-2 indices without radar metric mixing", async ({ page }) => {
   let failPreview = false;
   let failRecords = false;
+  let failDownload = false;
+  const refreshRequests = [];
   await page.route("**/api/sentinel2/*/*/*/png?**", async (route) => {
     if (failPreview && new URL(route.request().url()).searchParams.has("overview")) {
       await route.fulfill({ status: 503 });
@@ -1594,6 +1944,30 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
       contentType: "image/png",
       headers: { "cache-control": "no-store" },
       body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+    });
+  });
+  const indexDownloads = [];
+  await page.route("**/api/sentinel2/*/*/*/tif", async (route) => {
+    const url = new URL(route.request().url());
+    indexDownloads.push(url.pathname);
+    if (failDownload) {
+      await route.fulfill({
+        status: 409,
+        headers: { "access-control-allow-origin": "*" },
+        json: { detail: "NDVI GeoTIFF contains no valid pixels and cannot be downloaded." },
+      });
+      return;
+    }
+    const indexName = url.pathname.split("/").at(-2);
+    await route.fulfill({
+      status: 200,
+      contentType: "image/tiff",
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-expose-headers": "Content-Disposition",
+        "content-disposition": `attachment; filename="S2A_TEST_L2A-${indexName}.tif"`,
+      },
+      body: Buffer.from([0x49, 0x49, 42, 0, 1, 2, 3, 4]),
     });
   });
   const assessment = {
@@ -1616,6 +1990,7 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
     limitations: ["Sample-scoped fixture only"],
   };
   await page.route("**/api/sentinel2/observations**", async (route) => {
+    refreshRequests.push(new URL(route.request().url()).searchParams.get("refresh"));
     if (failRecords) {
       await route.fulfill({ status: 503, json: { detail: "Sentinel-2 unavailable" } });
       return;
@@ -1626,7 +2001,7 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
         river_id: url.searchParams.get("river_id"),
         source: "Microsoft Planetary Computer",
         collection: "sentinel-2-l2a",
-        observations: ["S2A_TEST_L2A", "S2B_TEST_L2A"].map((itemId) => ({
+        observations: ["S2A_TEST_L2A", "S2B_TEST_L2A", "S2C_GRID_MISMATCH"].map((itemId) => ({
           river_id: url.searchParams.get("river_id"),
           item_id: itemId,
           acquisition_datetime: "2026-11-13T05:10:41Z",
@@ -1635,16 +2010,35 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
           source: "Microsoft Planetary Computer",
           collection: "sentinel-2-l2a",
           valid_pixel_count: 120,
+          valid_pixel_counts_by_index: itemId === "S2B_TEST_L2A"
+            ? { ndvi: 120, evi: 0, ndmi: 120 }
+            : { ndvi: 120, evi: 120, ndmi: 120 },
           valid_pixel_percent: 80,
+          raster_pixel_percent: 0.128,
+          corridor_pixel_count: 150,
+          width: 1000,
+          height: 1000,
           crs: "EPSG:32643",
           resolution_m: 20,
+          nodata: -9999,
+          output_paths: { ndvi: "ndvi.tif", evi: "evi.tif", ndmi: "ndmi.tif" },
           bounds_wgs84: { west: 78, south: 10, east: 78.1, north: 10.1 },
           preview_color_scale: { low: "#313695", middle: "#ffffbf", high: "#006837" },
-          index_statistics: {
-            ndvi: { mean: 0.42, minimum: -0.2, maximum: 0.9 },
-            evi: { mean: 0.31, minimum: -0.1, maximum: 0.8 },
-            ndmi: { mean: 0.18, minimum: -0.3, maximum: 0.7 },
-          },
+          index_statistics: itemId === "S2B_TEST_L2A"
+            ? {
+              ndvi: { mean: 0.42, minimum: -0.2, maximum: 0.9 },
+              ndmi: { mean: 0.18, minimum: -0.3, maximum: 0.7 },
+            }
+            : {
+              ndvi: { mean: 0.42, minimum: -0.2, maximum: 0.9 },
+              evi: { mean: 0.31, minimum: -0.1, maximum: 0.8 },
+              ndmi: { mean: 0.18, minimum: -0.3, maximum: 0.7 },
+            },
+          raster_reconciliation: itemId === "S2C_GRID_MISMATCH" ? {
+            status: "catalog_grid_mismatch",
+            reason: "Stored catalog grid does not match the current raster grid.",
+            catalog_metadata: { width: 504, height: 2616, valid_pixel_count: 10 },
+          } : undefined,
           vegetation_validation: itemId === "S2A_TEST_L2A" ? {
             "agriculture:ndvi": assessment,
             "forest:ndvi": { ...assessment, status: "VALIDATION_FAILED", reason: "Forest index criterion was not met." },
@@ -1657,11 +2051,13 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
   });
   await page.getByRole("button", { name: "Agriculture" }).click();
   await expect(page.getByRole("heading", { name: "Sentinel-2 Level-2A vegetation indices" })).toBeVisible();
+  await expect(page.getByText("Vegetation indices—not crop maps")).toBeVisible();
+  await expect(page.getByText(/do not map the full agricultural area or surrounding fields/)).toBeVisible();
+  await expect(page.getByText(/not crop classifications or crop-health assessments/)).toBeVisible();
   await expect(page.getByLabel("Index")).toBeVisible();
   await expect(page.getByLabel("Opacity")).toBeVisible();
   await expect(page.locator(".sentinel2-index-card strong").first()).toHaveText("NDVI");
   await expect(page.getByText("mean 0.420").first()).toBeVisible();
-  await expect(page.getByText(/80.00% valid centerline pixels/).first()).toBeVisible();
   await expect(page.getByText(/Land-cover and change unvalidated/).first()).toBeVisible();
   await expect(page.getByText("Index validation: NOT_VALIDATED").first()).toBeVisible();
   await expect(page.getByText("Index validation: VALIDATED").first()).toBeVisible();
@@ -1669,7 +2065,49 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
   await expect(page.getByText(/RMSE 0.1000 · MAE 0.0800/).first()).toBeVisible();
   await expect(page.getByText(/natural_forest: 4 \(mean 0.500\)/).first()).toBeVisible();
   await expect(page.getByText("Sample-scoped fixture only").first()).toBeVisible();
-  const firstObservation = page.locator(".sentinel2-observation").first();
+  const agricultureSection = page.locator('section[aria-label="Agriculture monitoring"]');
+  const firstObservation = agricultureSection.locator(".sentinel2-observation").first();
+  const observationFacts = firstObservation.getByRole("group", { name: "S2A_TEST_L2A acquisition metadata and valid-data coverage" });
+  await expect(observationFacts.getByText("Valid NDVI · centerline")).toBeVisible();
+  await expect(observationFacts.getByText("80.00%")).toBeVisible();
+  await expect(observationFacts.getByText("120 / 150 pixels")).toBeVisible();
+  await expect(observationFacts.getByText("Valid NDVI · raster grid")).toBeVisible();
+  await expect(observationFacts.getByText("0.128%")).toBeVisible();
+  await expect(observationFacts.getByText("120 / 1,000,000 pixels")).toBeVisible();
+  await expect(observationFacts.getByText(/2026/)).toBeVisible();
+  await expect(observationFacts.getByText("20 m")).toBeVisible();
+  await expect(observationFacts.getByText("EPSG:32643")).toBeVisible();
+  await expect(observationFacts.getByText("-9999")).toBeVisible();
+  const noDataObservation = agricultureSection.locator(".sentinel2-observation").filter({ hasText: "S2B_TEST_L2A" });
+  const invalidDownloadButtons = noDataObservation.getByRole("button", { name: "Download EVI GeoTIFF" });
+  await expect(invalidDownloadButtons).toHaveCount(2);
+  for (let index = 0; index < await invalidDownloadButtons.count(); index += 1) {
+    await expect(invalidDownloadButtons.nth(index)).toBeDisabled();
+  }
+  await expect(noDataObservation.getByText("Download unavailable: No valid EVI pixels are recorded.").first()).toBeVisible();
+  const mismatchedObservation = agricultureSection.locator(".sentinel2-observation").filter({ hasText: "S2C_GRID_MISMATCH" });
+  for (const indexName of ["NDVI", "EVI", "NDMI"]) {
+    const buttons = mismatchedObservation.getByRole("button", { name: `Download ${indexName} GeoTIFF` });
+    await expect(buttons).toHaveCount(2);
+    for (let index = 0; index < await buttons.count(); index += 1) {
+      await expect(buttons.nth(index)).toBeDisabled();
+    }
+  }
+  for (const indexName of ["ndvi", "evi", "ndmi"]) {
+    const downloadPromise = page.waitForEvent("download");
+    await firstObservation.getByRole("button", { name: `Download ${indexName.toUpperCase()} GeoTIFF` }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe(`S2A_TEST_L2A-${indexName}.tif`);
+    const stream = await download.createReadStream();
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    expect(Buffer.concat(chunks).subarray(0, 4)).toEqual(Buffer.from([0x49, 0x49, 42, 0]));
+    expect(indexDownloads.at(-1)).toBe(`/api/sentinel2/kaveri/S2A_TEST_L2A/${indexName}/tif`);
+  }
+  failDownload = true;
+  await firstObservation.getByRole("button", { name: "Download NDVI GeoTIFF" }).click();
+  await expect(firstObservation.getByRole("alert")).toContainText("contains no valid pixels");
+  failDownload = false;
   for (const index of ["ndvi", "evi", "ndmi"]) {
     await expect(firstObservation.getByAltText(`${index.toUpperCase()} spatial index preview for S2A_TEST_L2A`))
       .toHaveAttribute("src", new RegExp(`/S2A_TEST_L2A/${index}/png\\?render=3&overview=true$`));
@@ -1688,15 +2126,16 @@ test("agriculture displays processed Sentinel-2 indices without radar metric mix
   await expect(page.locator(".sentinel2-map-footer")).toContainText("NDMI · -1");
   await expect(page.locator(".sentinel2-map-footer")).toContainText("+1 · transparent NoData");
   failPreview = true;
-  await page.getByRole("button", { name: "Refresh saved records" }).click();
-  await firstObservation.scrollIntoViewIfNeeded();
-  await expect(firstObservation.getByText("Preview unavailable. Check the API and try refreshing the records.").first()).toBeVisible();
+  await page.getByRole("button", { name: "Refresh and reprocess from source" }).click();
+  expect(refreshRequests.slice(-2)).toEqual(["true", "true"]);
+  await expect(page.locator(".sentinel2-observation").first()).toBeVisible();
+  await expect(page.locator(".sentinel2-observation").first().getByText("Preview unavailable. Check the API and try refreshing the records.").first()).toBeVisible();
   failPreview = false;
-  await page.getByRole("button", { name: "Refresh saved records" }).click();
+  await page.getByRole("button", { name: "Refresh and reprocess from source" }).click();
   await expect(firstObservation.getByAltText("NDVI spatial index preview for S2A_TEST_L2A")).toBeVisible();
   await expect.poll(() => firstObservation.getByAltText("NDVI spatial index preview for S2A_TEST_L2A").evaluate((image) => image.naturalWidth)).toBeGreaterThan(0);
   failRecords = true;
-  await page.getByRole("button", { name: "Refresh saved records" }).click();
+  await page.getByRole("button", { name: "Refresh and reprocess from source" }).click();
   await expect(page.getByRole("heading", { name: "Sentinel-2 observations unavailable" })).toBeVisible();
   await expect(page.locator(".sentinel2-observation")).toHaveCount(0);
   await expect(page.getByText("Loading", { exact: true })).toHaveCount(0);
@@ -1791,8 +2230,8 @@ test("real-data Overview distinguishes NISAR and Sentinel-1 evidence without sim
   await page.reload();
 
   const acquisitionPanel = page.getByRole("article", { name: "Automatic satellite data acquisition" });
-  await expect(page.getByText("REAL DATA ONLY").first()).toBeVisible();
-  await expect(page.getByText("Overview values come from persisted satellite acquisition records")).toBeVisible();
+  await expect(page.getByText("LOCAL EVIDENCE").first()).toBeVisible();
+  await expect(page.getByText("Persisted observations and processing outputs are shown with their provenance and validation state")).toBeVisible();
   await expect(page.getByText("Illustrative", { exact: true })).toHaveCount(0);
   await expect(page.getByText("not satellite-derived")).toHaveCount(0);
   const realMetrics = page.locator('[aria-label="Real satellite overview"]');
@@ -1955,4 +2394,220 @@ test("Impact Explorer reports unavailable metrics when no eligible NISAR candida
   const impact = page.getByRole("region", { name: "Impact explorer" });
   await expect(impact.getByText("No eligible NISAR candidate is available for the selected river. Candidate metrics are unavailable.")).toBeVisible();
   await expect(impact.getByText("Unavailable", { exact: true })).toHaveCount(2);
+});
+
+test("GIS Explorer toggles real layers, inspects pixels, and downloads selected data", async ({ page }) => {
+  const riverLayer = {
+    layer_id: "river-centerlines",
+    name: "Registered river centerlines",
+    category: "Rivers",
+    layer_type: "vector",
+    status: "available",
+    source: "OpenStreetMap river geometry",
+    crs: "EPSG:4326",
+    geometry_type: "LineString",
+    feature_count: 1,
+    bounds_wgs84: { west: 75.4, south: 15.4, east: 76.0, north: 16.0 },
+    provenance: "Registered centerline only.",
+  };
+  const rasterLayer = {
+    layer_id: "s2-fixture",
+    name: "Sentinel-2 NDVI · Kaveri · 2026-11-13",
+    category: "Sentinel-2 vegetation indices",
+    layer_type: "raster",
+    status: "available",
+    source: "Sentinel-2 L2A",
+    date: "2026-11-13T05:10:41Z",
+    crs: "EPSG:32643",
+    resolution_m: 10,
+    width: 3,
+    height: 2,
+    data_type: "float32",
+    nodata: -9999,
+    valid_pixel_count: 4,
+    bounds_wgs84: { west: 75.4, south: 15.4, east: 76.0, north: 16.0 },
+    preview_bounds_wgs84: { west: 75.4, south: 15.4, east: 76.0, north: 16.0 },
+    provenance: "Locally processed product; centerline clipped.",
+  };
+  const unavailable = {
+    layer_id: "nisar-candidate-water",
+    name: "NISAR GCOV candidate water",
+    category: "NISAR",
+    layer_type: "unavailable",
+    status: "unavailable",
+    source: "Local processed NISAR outputs",
+    provenance: "No local candidate raster.",
+    message: "No local NISAR candidate-water raster is available to display.",
+  };
+  await page.route("**/api/gis/layers?river_id=*", (route) => route.fulfill({
+    json: {
+      layers: [riverLayer, rasterLayer, unavailable],
+      limitations: ["The existing index layer is centerline-clipped."],
+    },
+  }));
+  await page.route("**/api/gis/layers/river-centerlines/features?*", (route) => route.fulfill({
+    json: {
+      type: "FeatureCollection",
+      features: [{
+        type: "Feature",
+        id: "kaveri",
+        properties: { river_id: "kaveri", name: "Kaveri River" },
+        geometry: { type: "LineString", coordinates: [[75.4, 15.4], [76, 16]] },
+      }],
+    },
+  }));
+  let failPreview = false;
+  await page.route("**/api/gis/layers/s2-fixture/preview.png?*", (route) => {
+    if (failPreview) return route.fulfill({ status: 503, body: "Preview unavailable" });
+    return route.fulfill({
+      contentType: "image/png",
+      body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+    });
+  });
+  await page.route("**/api/gis/inspect", (route) => route.fulfill({
+    json: {
+      latitude: 15.7,
+      longitude: 75.7,
+      layers: [{
+        layer_id: "s2-fixture",
+        name: rasterLayer.name,
+        status: "available",
+        value: 0.25,
+        valid: true,
+        reason: null,
+      }],
+    },
+  }));
+  await page.route("**/api/gis/measure", (route) => route.fulfill({
+    json: {
+      geometry_type: "LineString",
+      length_m: 1234,
+      area_m2: 0,
+      measurement_crs: "UTM zone EPSG:32643 length; EPSG:6933 equal-area surface area.",
+    },
+  }));
+  await page.route("**/api/gis/layers/s2-fixture/download?*", (route) => route.fulfill({
+    status: 200,
+    contentType: "image/tiff",
+    headers: { "content-disposition": 'attachment; filename="s2-fixture.tif"' },
+    body: Buffer.from([0x49, 0x49, 42, 0, 1, 2, 3, 4]),
+  }));
+  await page.route("**/api/gis/layers/river-centerlines/download?*", (route) => route.fulfill({
+    status: 200,
+    contentType: "text/csv",
+    headers: { "content-disposition": 'attachment; filename="river-centerlines.csv"' },
+    body: "feature_id,name\nkaveri,Kaveri River\n",
+  }));
+  await page.route("https://*.tile.openstreetmap.org/**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+
+  await page.getByRole("button", { name: "GIS Explorer", exact: true }).click();
+  await expect(page.getByRole("region", { name: "GIS Explorer" })).toBeVisible();
+  await expect(page.getByLabel("Show NISAR GCOV candidate water")).toBeDisabled();
+  await expect(page.getByText(unavailable.message)).toBeVisible();
+  await page.getByLabel(`Show ${rasterLayer.name}`).check();
+  await expect(page.locator(".gis-leaflet-map img.leaflet-image-layer")).toBeVisible();
+  await expect(page.getByText("Raster grid")).toBeVisible();
+
+  await page.locator(".gis-leaflet-map").click({ position: { x: 180, y: 180 } });
+  await expect(page.getByText("Pixel value: 0.25")).toBeVisible();
+  const rasterDownload = page.waitForEvent("download");
+  await page.getByRole("link", { name: "Download GeoTIFF" }).click();
+  expect((await rasterDownload).suggestedFilename()).toBe("s2-fixture.tif");
+  failPreview = true;
+  await page.getByLabel(`Show ${rasterLayer.name}`).uncheck();
+  await page.getByLabel(`Show ${rasterLayer.name}`).check();
+  await expect(page.getByRole("alert").filter({ hasText: "Raster preview failed (503)." })).toBeVisible();
+
+  await page.locator(".gis-layer-name").filter({ hasText: riverLayer.name }).click();
+  const vectorDownload = page.waitForEvent("download");
+  await page.getByRole("link", { name: "Export attributes CSV" }).click();
+  expect((await vectorDownload).suggestedFilename()).toBe("river-centerlines.csv");
+
+  await page.getByRole("button", { name: "Measure distance" }).click();
+  await page.locator(".gis-leaflet-map").click({ position: { x: 110, y: 120 } });
+  await page.locator(".gis-leaflet-map").click({ position: { x: 210, y: 220 } });
+  await page.getByRole("button", { name: "Finish" }).click();
+  await expect(page.getByText("Geometry", { exact: true })).toBeVisible();
+  await expect(page.getByText("1.234 km")).toBeVisible();
+});
+
+test("workspace navigation stays responsive without browser or horizontal-overflow errors", async ({ page }) => {
+  const browserErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") browserErrors.push(`${message.text()} ${message.location().url}`);
+  });
+  page.on("pageerror", (error) => browserErrors.push(error.message));
+  page.on("response", (response) => {
+    if (response.status() >= 400) browserErrors.push(`${response.status()} ${response.url()}`);
+  });
+  await page.route("https://*.tile.openstreetmap.org/**", (route) => route.fulfill({
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lbcAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.route("**/api/gis/layers?*", (route) => route.fulfill({
+    json: { layers: [], limitations: [] },
+  }));
+  await page.route("**/api/forest/observations?*", async (route) => {
+    const riverId = new URL(route.request().url()).searchParams.get("river_id");
+    await route.fulfill({
+      json: {
+        river_id: riverId,
+        source: "Microsoft Planetary Computer",
+        collection: "sentinel-2-l2a",
+        observations: [],
+        distinct_processed_acquisition_times: [],
+        temporal_change_status: "insufficient_observations",
+        limitations: [],
+      },
+    });
+  });
+  await page.route("**/api/forest/references", (route) => route.fulfill({
+    json: { references: [], tree_cover_statistics_status: "not_available" },
+  }));
+  await page.route("**/api/sentinel2/observations?*", async (route) => {
+    const riverId = new URL(route.request().url()).searchParams.get("river_id");
+    await route.fulfill({
+      json: {
+        river_id: riverId,
+        source: "Microsoft Planetary Computer",
+        collection: "sentinel-2-l2a",
+        observations: [],
+        historical_comparisons: [],
+        limitations: [],
+      },
+    });
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator(".status-pill")).toContainText("Local product catalog");
+  await expect(page.getByText("Evidence-first monitoring")).toBeVisible();
+
+  for (const label of [
+    "Overview",
+    "Map explorer",
+    "GIS Explorer",
+    "Change analysis",
+    "Impact explorer",
+    "Agriculture",
+    "Forest monitoring",
+    "AI analysis",
+    "Data & methodology",
+    "About the project",
+  ]) {
+    await page.getByRole("button", { name: "Open navigation" }).click();
+    const navigationName = ["Data & methodology", "About the project"].includes(label)
+      ? "Project navigation"
+      : "Main navigation";
+    const navigation = page.getByRole("navigation", { name: navigationName });
+    await navigation.getByRole("button", { name: label, exact: true }).click();
+    await expect(navigation.getByRole("button", { name: label, exact: true })).toHaveAttribute("aria-current", "page");
+    const dimensions = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      viewportWidth: document.documentElement.clientWidth,
+    }));
+    expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.viewportWidth + 1);
+  }
+  expect(browserErrors).toEqual([]);
 });

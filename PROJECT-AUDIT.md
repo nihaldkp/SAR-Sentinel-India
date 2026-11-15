@@ -1,10 +1,152 @@
 # SAR Sentinel India — Architecture and Implementation Audit
 
-**Audit date:** 2026-11-10
+**Audit date:** 2026-11-15
 
 **Workspace:** `D:\SAR-Sentinel-India`
 
 **Status:** Snapshot of the implemented application and verified data, not a claim of scientific validation or project completion.
+
+## 2026-11-15 — presentation-readiness and cached-download audit
+
+| Module | Current state | Evidence and limits |
+| --- | --- | --- |
+| GIS Explorer | Implemented for locally catalogued project data. | Catalog lists 69 available and 4 unavailable layer types. Raster previews are display-only EPSG:3857; native downloads retain their source grids. Candidate SAR layers are not validated. |
+| Agriculture / Sentinel-2 indices | Cached NDVI/EVI/NDMI generation and download workflow implemented, with limited support. | Fifteen available index downloads across five observations were served byte-for-byte from their local analysis rasters and reopened in Rasterio. One older Kaveri tile has a catalog/raster grid mismatch; its three downloads are withheld in the UI. Valid-pixel fractions of each rectangular raster range from 0.071069% to 0.833680%; these are centerline-clipped products, not broad-area Agriculture coverage. |
+| Forest monitoring | Partial, real Sentinel-2 zone analysis. | Two tile analyses use the 2026-11-13 acquisition. No WorldCover/tree-cover pixels are imported; there is one optical date, no compatible river-water comparison, and no forest change or independent validation result. |
+| NISAR / Sentinel-1 | Candidate processing and comparison workflows exist. | NISAR A_009 has a single-date candidate output; A_010 has no usable pixels. Stored Sentinel-1 comparison pairs remain unvalidated candidates. No independent accuracy or verified water boundary is established. |
+| AI Analysis | Deterministic evidence summaries, not a learned model. | Summaries use persisted records and disclose missing evidence; they do not establish causation or supply missing measurements. |
+
+The Agriculture download audit identified an additional cache-integrity case:
+five older processed records lack catalogued affine transforms (and have stale
+or absent bounds), although each set of three GeoTIFFs has valid, aligned
+source georeferencing. Downloads for these records now use the GeoTIFF
+georeferencing only when the catalog transform is absent and expose
+`X-Raster-Catalog-Georeferencing: reconciled-from-geotiff`. Conflicting
+catalog transforms remain rejected. The separate Kaveri T43PHP row has a
+catalog/raster dimension mismatch and is not downloadable; the UI surfaces
+that state. This does not repair or rewrite the stored catalog or establish
+independent provenance for older outputs.
+
+All checks in this audit used cached local outputs with automatic acquisition
+disabled; no satellite data were downloaded or refreshed. An available cached
+API smoke covered 12 endpoints. Current final test results are recorded in the
+handoff and completion report. No new scientific checklist item is completed
+by this audit. Presentation status: suitable for a cached-data demonstration
+only when these coverage and validation limits are disclosed.
+
+## 2026-11-15 forest reference workflow and mask audit (partial)
+
+The Forest processor now explicitly applies each source raster's validity mask
+to the bounded Sentinel-2 B02/B04/B08 and SCL reads, as well as NoData and
+SCL 4/5 filtering. The processor version was bumped, invalidating reuse of
+older analysis identities; the existing real pilot outputs were not rerun.
+
+A local ESA WorldCover 2021 v200 import endpoint and persistent zonal
+tree-cover job now exist. Import is capped at 100 MiB and 80 million source
+pixels, validates single-band uint8 GeoTIFF/CRS/NoData, hashes and stores
+uploads idempotently, reprojects to EPSG:6933 at 10 m, and reports class-10
+area and valid-data coverage per zone. The UI offers import, job progress,
+statistics, downloads and an optional raster overlay. Synthetic fixtures
+verified these paths, including withholding class rasters when no recognized
+valid classes overlap the zones.
+
+No actual WorldCover pixels were imported or used in project results. The
+upload's dataset identity is user-supplied and unauthenticated. Class 10
+includes plantations and WorldCover is partly Sentinel-2-derived, so it
+cannot be treated as independent forest truth. The local real observations
+still have one distinct processed optical date and no spatially/temporally
+matched water observations; temporal change and river–vegetation analysis
+remain unsupported. No forest gain/loss or causal claim is made.
+
+Verification for this continuation: backend **267 passed, 3 skipped**; full
+Playwright had **34 passed and one intermittent failure** in an existing
+Agriculture refresh/scroll test (isolated rerun passed); the Forest browser
+flow passed. Frontend production build, Python `compileall`, `pip check`, and
+`git diff --check` passed. Three backend skips are the existing opt-in/live
+or Windows-symlink tests. Synthetic reference rasters were used only in
+temporary test directories; no real reference or new satellite output was
+created. Existing 2026-11-13 Sentinel-2 pilot products were not reprocessed.
+
+## 2026-11-15 Agriculture download audit (partial)
+
+The reported `ndvi.tif` is not a malformed download: the API served a valid
+GeoTIFF matching the cached analysis. Its 0.128% valid fraction used all
+3,575,382 cells in a 4,503 × 794 rectangle as denominator. The product is
+deliberately clipped to the mapped centerline, where the original 4,585 valid
+pixels represented 97.55% of 4,700 mapped cells. The real producer defect was
+that vegetation-index validity included Sentinel-2 SCL water (6) and
+unclassified (7) pixels.
+
+Processor 1.5 now retains only SCL classes 4/5, aligns scaled B02/B04/B08 to
+the B11 20 m EPSG:32644 grid, reprojects source-validity masks from bounded
+windows, and preserves NoData. The Kaveri T44PKT observation from
+2026-11-13T05:10:41.025Z was regenerated. Its NDVI/EVI/NDMI outputs each have
+2,541 valid pixels (54.0638% of mapped centerline support; 0.071069% of the
+rectangular grid). The change from 4,585 to 2,541 is explained by excluded
+water/unclassified and other non-vegetation SCL classes; no values were
+fabricated. All download endpoints now reject stale grids, unreadable/
+incompatible outputs, and zero-valid-pixel outputs. Frontend downloads display
+both denominators and show the API error instead of silently saving an error
+response as a `.tif`.
+
+All three actual endpoint responses returned 200, matched their generated
+files byte-for-byte, and reopened in Rasterio with EPSG:32644, Float32,
+NoData -9999, expected shape and 2,541 valid pixels. Full backend: 265 passed,
+3 skipped; full Playwright: 35 passed. Python compilation, `pip check`,
+frontend production build and `git diff --check` passed. No full-area
+Agriculture AOI exists; the raster percentage is not coverage of an
+agricultural study area. No crop/forest classification or independent
+validation is claimed.
+
+## 2026-11-15 forest zone-analysis audit (partial)
+
+Unlike the existing centerline-clipped index path, the new Forest analysis
+reads required source Sentinel-2 L2A COGs and performs bounded windowed
+processing for configurable centerline-distance zones. It uses SCL classes 4
+and 5, records NoData/valid-data support, aligns 10 m reflectance bands to the
+native 20 m B11 grid, and stores reproducible outputs and provenance. This
+avoids presenting centerline-only pixels as surrounding land observations.
+
+One Kaveri tile (T44PKS) and one Tungabhadra tile (T44PKC) were processed for
+2026-11-13T05:10:41.025Z in EPSG:32644 at 20 m. They are partial footprints.
+The persisted analysis IDs are
+`cdf6a16f5786d63caf06e505fdad8cb4038fac82ac503b6c5d71693834c12a23` and
+`8690117ed95aebf732826cc3165047c171e816728aaaa60b5f2023570e051378`.
+Kaveri zone raster coverage is 96.7%, 87.1%, 56.1%, 50.2%; valid-data coverage
+is 63.5%, 72.4%, 67.0%, 62.3%. Tungabhadra coverage is 94.2%, 86.0%, 73.2%,
+62.7%; valid-data coverage is 23.7%, 28.7%, 51.3%, 77.0%. These statistics
+describe spectral indices and data support, not tree cover.
+
+Tree-cover area/classification is not available because no reference pixels
+are integrated. ESA WorldCover 2021 v200 is metadata-only and is not
+independent validation. Only one processed optical time exists, and the radar
+water observations have not been harmonized to these analysis zones; no
+temporal vegetation-change or river–vegetation relationship result is
+supported. No forest-loss, causal, or independent-validation claim is made.
+The national-platform forest-monitoring checklist item remains unchecked.
+Verification for this continuation: backend 262 passed/3 skipped, Playwright
+35 passed, frontend build, Python compilation, `pip check`, and
+`git diff --check` passed. Persisted outputs were also checked through the
+API, GeoJSON validity, raster CRS/grid/NoData, previews, and evidence-summary
+routes. The feature remains partial because these two tile/date outputs do
+not fulfill full-corridor, reference, temporal, relationship, or independent
+validation requirements.
+
+## 2026-11-15 forest workspace audit (earlier partial snapshot)
+
+The Forest monitoring page reuses the Sentinel-2 index workflow. It now shows
+the processed tile count separately from distinct acquisition timestamps and
+exposes the actual NDVI/EVI/NDMI GeoTIFF downloads. Local API inspection
+confirmed six processed tile outputs across Kaveri and Tungabhadra, all at the
+same 2026-11-13T05:10:41Z acquisition time; one additional Kaveri record has
+no usable pixels. The selected raster download routes returned HTTP 200.
+
+This does not constitute a forest-monitoring implementation: the existing
+indices are clipped to mapped OSM centerlines, there is no suitable integrated
+tree-cover/land-cover reference, and there is only one processed date. Forest
+cover mapping, distance-zone statistics, multi-date changes,
+river/vegetation-relationship analysis, and forest-specific AI remain
+unavailable. The related national-platform checklist item remains unchecked.
 
 ## National platform checkpoint
 

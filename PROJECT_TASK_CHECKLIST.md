@@ -1,6 +1,61 @@
 # SAR Sentinel India — Master Task Checklist
 
-Completion percentage is calculated only from checked items: **64 / 69 = 92.8%**. “Partial” and “blocked” items do not count as complete; this is not a scientific validation score.
+Completion percentage is calculated only from checked items: **65 / 70 = 92.9%**. “Partial” and “blocked” items do not count as complete; this is not a scientific validation score.
+
+2026-11-15 cached-data presentation audit: verified 15 available
+Agriculture NDVI/EVI/NDMI downloads from five local observations against their
+source GeoTIFFs; all matched byte-for-byte and reopened with valid pixels.
+Their 0.071069%–0.833680% rectangular-grid coverage is from
+centerline-clipped outputs, not area-wide Agriculture coverage. Three
+downloads for a catalog/raster grid-mismatch record are withheld with a clear
+UI warning. Legacy missing transform metadata is reconciled from aligned
+GeoTIFFs and flagged in a response header. This adds no validated
+forest/water/vegetation result and changes no checklist count.
+
+Final verification: backend **272 passed, 3 skipped**; Playwright **37
+passed**; frontend build, npm dependency tree, Python compilation,
+`pip check`, and `git diff --check` passed. The production build has a 528.30
+kB chunk-size advisory. The skips are opt-in Earthdata checks and a
+Windows-symlink privilege limitation.
+
+Latest GIS Explorer continuation (not part of the historical 70-item score):
+implemented local layer discovery and status, Leaflet rendering, raster/vector
+inspection, safe temporary GeoJSON import, measurements/drawings, and actual
+local-data downloads. Catalog check: 69 available, four unavailable layer
+types (river banks, flood/inundation, administrative boundaries, tree-cover
+reference). Full backend 272 passed/3 skipped; build, compile, dependency and
+diff checks passed. Full Playwright now passes all 37 tests after removing the
+stale Agriculture detached-locator call; the GIS browser test passed.
+This does not add satellite observations or complete broader
+scientific-monitoring tasks. See [GIS Explorer documentation](./docs/GIS_EXPLORER.md).
+
+2026-11-15 Agriculture download correction (partial): fixed Sentinel-2 processing
+to exclude SCL water/unclassified pixels, validate GeoTIFFs against catalogued
+grids before download, report centerline and rectangular-grid coverage
+separately, and surface explicit frontend errors. Regenerated the Kaveri
+2026-11-13 T44PKT outputs: 2,541/4,700 mapped centerline pixels valid (54.0638%)
+and 2,541/3,575,382 rectangular cells valid (0.071069%). The latter is expected
+for this centerline-clipped product; no area-wide Agriculture AOI exists.
+Backend 265 passed/3 skipped; Playwright 35 passed. The
+high-level Agriculture monitoring item remains unchecked. See README and
+[PROJECT_HANDOFF.md](./PROJECT_HANDOFF.md).
+
+2026-11-15 Forest monitoring continuation (partial): added source-mask-aware
+Sentinel-2 zone processing (processor 1.3), a bounded/idempotent local
+WorldCover 2021 GeoTIFF import, per-zone class-10 statistics, persistent
+statistics jobs, raster/CSV/preview outputs, and a Forest UI import/map
+workflow. Synthetic tests cover import, CRS alignment, zonal statistics,
+insufficient-data withholding, downloads, and evidence grounding. No actual
+WorldCover pixels were downloaded or imported. Six usable optical tiles still
+share only one acquisition time, and no matched river-water observations are
+available; temporal change and river–vegetation analysis remain incomplete.
+The national-platform forest-monitoring item remains unchecked. Full backend
+verification passed (**267 passed/3 skipped**). Full Playwright had **34
+passed and one intermittent failure** in an existing Agriculture
+refresh/scroll test; the isolated rerun passed, as did the Forest flow. Build,
+compile, dependency and diff checks passed; the frontend build reports its
+large-chunk warning. No real reference raster or new satellite observation
+was generated. See [PROJECT_HANDOFF.md](./PROJECT_HANDOFF.md).
 
 National platform phase checkpoint (not included in the historical 69 items):
 - [ ] National source import, spatial database, paginated explorer and general river monitoring. NWIC API and map explorer work with an isolated real single-feature extract; review-only snapshot staging and provisional comparison exist. Full national import, dataset-specific rights, stable identities, reviewed reconciliation and atomic publication, unified selection and general monitoring remain incomplete. See [handoff](./PROJECT_HANDOFF.md).
@@ -126,6 +181,7 @@ The canonical NISAR classification has no spatial filter. An opt-in API/dashboar
 - [x] Add an independently selectable Sentinel-2 NDWI candidate raster layer with geospatial metadata, class/NoData legend, and explicit exploratory warning.
 - [x] Add deterministic local AI Analysis using persisted satellite records, selectable products, diagnostics, loading/error/empty states, and explicit scientific limitations.
 - [x] Keep download controls conditional on real output references and persisted files.
+- [x] Validate Agriculture NDVI/EVI/NDMI GeoTIFF downloads against persisted outputs and display both centerline and raster-grid coverage.
 
 ## Phase 11 — Performance, QA and documentation
 

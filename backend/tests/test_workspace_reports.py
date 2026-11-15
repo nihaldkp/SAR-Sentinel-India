@@ -37,6 +37,7 @@ def report_data(monkeypatch, tmp_path):
     record = {
         "river_id": "kaveri", "item_id": "TEST-OBSERVATION",
         "status": "processed", "valid_pixel_count": 4,
+        "corridor_pixel_count": 8,
         "acquisition_datetime": "2026-01-02T00:00:00Z",
         "resolution_m": 20,
     }
@@ -89,6 +90,8 @@ def test_selected_raster_and_catalog_mismatch(report_data, index, mean):
     assert b"TEST-OBSERVATION" in text
     assert mean in text
     assert b"NOT_VALIDATED" in text
+    assert b"50.0000%" in text
+    assert b"37.5000%" in text
     if index == "ndvi":
         assert b"discrepancy has not been resolved" in text
     else:

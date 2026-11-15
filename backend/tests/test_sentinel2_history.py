@@ -83,13 +83,60 @@ def test_rendered_preview_is_rgba_with_transparent_nodata(tmp_path) -> None:
             assert dataset.read(4).tolist() == [[255, 0]]
 
 
+def test_reflectance_validity_is_resampled_from_the_target_window(tmp_path) -> None:
+    source_path = tmp_path / "source-mask.tif"
+    with rasterio.open(
+        source_path,
+        "w",
+        driver="GTiff",
+        height=100,
+        width=100,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:32644",
+        transform=from_origin(0, 1000, 10, 10),
+    ) as output:
+        output.write(np.ones((100, 100), dtype="uint8"), 1)
+        mask = np.full((100, 100), 255, dtype="uint8")
+        mask[40:42, 40:42] = 0
+        output.write_mask(mask)
+
+    with rasterio.open(source_path) as dataset:
+        valid = sentinel2._read_validity_to_grid(
+            dataset,
+            (2, 2),
+            from_origin(400, 600, 20, 20),
+            dataset.crs,
+        )
+
+    assert valid.tolist() == [[False, True], [True, True]]
+
+
 def test_preview_endpoint_uses_each_geotiff_not_cached_png(tmp_path, monkeypatch) -> None:
     root = tmp_path / "sentinel2"
     monkeypatch.setattr(sentinel2, "DATA_ROOT", root)
     folder = root / "kaveri" / "observation"
     values = np.array([[-1, 0, 1], [0.25, -9999, np.nan]], dtype="float32")
+    output_paths = {}
     for index, offset in (("ndvi", 0), ("evi", 0.1), ("ndmi", 0.2)):
-        _write_index(folder / f"{index}.tif", np.where(np.isfinite(values) & (values != -9999), values + offset, values))
+        path = folder / f"{index}.tif"
+        _write_index(path, np.where(np.isfinite(values) & (values != -9999), values + offset, values))
+        output_paths[index] = path.relative_to(root.parent.parent).as_posix()
+    with rasterio.open(folder / "ndvi.tif") as dataset:
+        catalog_record = {
+                "river_id": "kaveri",
+                "item_id": "observation",
+                "status": "processed",
+            "width": dataset.width,
+            "height": dataset.height,
+            "crs": dataset.crs.to_string(),
+            "transform": list(dataset.transform),
+            "bounds_wgs84": sentinel2._wgs84_bounds(dataset),
+            "corridor_pixel_count": 4,
+            "valid_pixel_count": 4,
+            "output_paths": output_paths,
+        }
+    monkeypatch.setattr(sentinel2, "_load_catalog", lambda: [catalog_record])
     # A stale cache must neither be required nor treated as source data.
     (folder / "ndvi.png").write_bytes(b"stale")
 
@@ -109,6 +156,109 @@ def test_preview_endpoint_uses_each_geotiff_not_cached_png(tmp_path, monkeypatch
                 previews.append(image)
     assert not np.array_equal(previews[0], previews[1])
     assert not np.array_equal(previews[1], previews[2])
+
+
+def test_index_geotiff_downloads_are_valid_and_match_generated_rasters(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "data" / "acquisitions" / "sentinel2"
+    monkeypatch.setattr(sentinel2, "DATA_ROOT", root)
+    values = np.array([[0.25, -9999]], dtype="float32")
+    folder = root / "kaveri" / "observation"
+    output_paths = {}
+    for index_name in ("ndvi", "evi", "ndmi"):
+        path = folder / f"{index_name}.tif"
+        _write_index(path, values)
+        output_paths[index_name] = path.relative_to(root.parent.parent).as_posix()
+    with rasterio.open(folder / "ndvi.tif") as dataset:
+        catalog_record = {
+            "river_id": "kaveri",
+            "item_id": "observation",
+            "status": "processed",
+            "width": dataset.width,
+            "height": dataset.height,
+            "crs": dataset.crs.to_string(),
+            "transform": list(dataset.transform),
+            "bounds_wgs84": sentinel2._wgs84_bounds(dataset),
+            "corridor_pixel_count": 1,
+            "valid_pixel_count": 1,
+            "output_paths": output_paths,
+        }
+    monkeypatch.setattr(sentinel2, "_load_catalog", lambda: [catalog_record])
+    client = TestClient(app)
+
+    for index_name in ("ndvi", "evi", "ndmi"):
+        response = client.get(f"/api/sentinel2/kaveri/observation/{index_name}/tif")
+        path = folder / f"{index_name}.tif"
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("image/tiff")
+        assert f'filename="observation-{index_name}.tif"' in response.headers["content-disposition"]
+        assert response.content == path.read_bytes()
+        with rasterio.MemoryFile(response.content) as memory_file:
+            with memory_file.open() as dataset:
+                raster = dataset.read(1, masked=True)
+                assert dataset.count == 1
+                assert dataset.dtypes == ("float32",)
+                assert dataset.crs.to_string() == "EPSG:32644"
+                assert dataset.nodata == -9999.0
+                assert dataset.width == 2 and dataset.height == 1
+                assert raster.count() == 1
+                assert raster.compressed().tolist() == [0.25]
+        assert response.headers["x-raster-valid-pixels"] == "1"
+        assert response.headers["x-centerline-valid-percent"] == "100.000000"
+
+    catalog_record.pop("transform")
+    catalog_record["bounds_wgs84"]["west"] += 0.1
+    response = client.get("/api/sentinel2/kaveri/observation/ndvi/tif")
+    assert response.status_code == 200
+    assert response.headers["x-raster-catalog-georeferencing"] == "reconciled-from-geotiff"
+    assert response.content == (folder / "ndvi.tif").read_bytes()
+
+
+def test_index_download_rejects_stale_grid_and_empty_outputs(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "data" / "acquisitions" / "sentinel2"
+    monkeypatch.setattr(sentinel2, "DATA_ROOT", root)
+    folder = root / "kaveri" / "observation"
+    output_paths = {}
+    for index_name in ("ndvi", "evi", "ndmi"):
+        path = folder / f"{index_name}.tif"
+        _write_index(path, np.full((2, 2), -9999, dtype="float32"))
+        output_paths[index_name] = path.relative_to(root.parent.parent).as_posix()
+    with rasterio.open(folder / "ndvi.tif") as dataset:
+        catalog_record = {
+        "river_id": "kaveri",
+        "item_id": "observation",
+        "status": "processed",
+            "width": dataset.width,
+            "height": dataset.height,
+            "crs": dataset.crs.to_string(),
+            "transform": list(dataset.transform),
+            "bounds_wgs84": sentinel2._wgs84_bounds(dataset),
+            "corridor_pixel_count": 10,
+            "valid_pixel_count": 1,
+            "output_paths": output_paths,
+        }
+    monkeypatch.setattr(sentinel2, "_load_catalog", lambda: [catalog_record])
+
+    response = TestClient(app).get("/api/sentinel2/kaveri/observation/ndvi/tif")
+
+    assert response.status_code == 409
+    assert "no valid pixels" in response.json()["detail"]
+    catalog_record["width"] = 1
+    response = TestClient(app).get("/api/sentinel2/kaveri/observation/ndvi/tif")
+    assert response.status_code == 409
+    assert "no longer matches its catalogued grid" in response.json()["detail"]
+    catalog_record["width"] = 2
+    catalog_record["transform"][0] += 20
+    response = TestClient(app).get("/api/sentinel2/kaveri/observation/ndvi/tif")
+    assert response.status_code == 409
+    assert "stale catalogued transform" in response.json()["detail"]
+    with rasterio.open(folder / "ndvi.tif") as dataset:
+        catalog_record["transform"] = list(dataset.transform)
+        catalog_record["bounds_wgs84"] = sentinel2._wgs84_bounds(dataset)
+    catalog_record["bounds_wgs84"]["west"] += 0.1
+    response = TestClient(app).get("/api/sentinel2/kaveri/observation/ndvi/tif")
+    assert response.status_code == 409
+    assert "catalogued bounds" in response.json()["detail"]
 
 
 def test_preview_respects_internal_mask_and_north_up_orientation(tmp_path) -> None:
@@ -165,6 +315,18 @@ def test_cached_observation_bounds_match_preview_projection(tmp_path, monkeypatc
         projected = transform_bounds(dataset.crs, "EPSG:3857", *dataset.bounds)
     expected = transform_bounds("EPSG:3857", "EPSG:4326", *projected)
     assert list(record["bounds_wgs84"].values()) == pytest.approx(expected)
+
+
+def test_cached_raster_accepts_windows_catalog_paths_and_rejects_escape(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "data" / "acquisitions" / "sentinel2"
+    monkeypatch.setattr(sentinel2, "DATA_ROOT", root)
+    path = root / "kaveri" / "item" / "ndvi.tif"
+    _write_index(path, np.ones((2, 2), dtype="float32"))
+    record = {"output_paths": {"ndvi": r"acquisitions\sentinel2\kaveri\item\ndvi.tif"}}
+    assert sentinel2._cached_raster_path(record, "ndvi") == path.resolve()
+    record["output_paths"]["ndvi"] = r"acquisitions\sentinel2\..\..\outside.tif"
+    with pytest.raises(ValueError, match="output is unavailable"):
+        sentinel2._cached_raster_path(record, "ndvi")
 
 
 def test_grid_mismatch_reports_raster_statistics_without_changing_catalog(tmp_path, monkeypatch) -> None:

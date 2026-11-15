@@ -1,11 +1,12 @@
 import asyncio
+import json
 import sqlite3
 from datetime import date
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import ValidationError
 import rasterio
@@ -68,6 +69,23 @@ from app.schemas.sentinel2 import (
     Sentinel2ComparisonResponse,
     Sentinel2ObservationResponse,
 )
+from app.schemas.forest_monitoring import (
+    ForestAnalysisRequest,
+    ForestAnalysisSummary,
+    ForestEvidenceSummary,
+    ForestObservationCatalog,
+    ForestReferenceCatalog,
+    ForestReferenceImportResponse,
+    ForestTreeCoverRequest,
+    ForestTreeCoverStatistics,
+)
+from app.schemas.gis_explorer import (
+    GISImportResponse,
+    GISInspectRequest,
+    GISLayer,
+    GISLayerCatalog,
+    GISMeasurementRequest,
+)
 from app.schemas.vegetation_validation import VegetationAssessmentProtocol
 from app.schemas.workspace_report import WorkspaceReportRequest
 from app.services import analysis
@@ -83,6 +101,8 @@ from app.services.catalog import DEMO_OBSERVATIONS, DEMO_REGIONS
 from app.services.rivers import RIVER_CATALOG
 from app.services.satellite import search_satellite_catalog
 from app.services import sentinel2
+from app.services import forest_monitoring
+from app.services import gis_explorer
 from app.services import validation
 from app.services import vegetation_validation
 from app.services import workspace_reports
@@ -90,6 +110,455 @@ from app.services import workspace_reports
 router = APIRouter(prefix="/api")
 MAX_ANALYSIS_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_METHOD_EVALUATION_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
+@router.get(
+    "/forest/observations",
+    response_model=ForestObservationCatalog,
+    tags=["forest"],
+)
+def get_forest_observations(
+    river_id: Literal["kaveri", "tungabhadra"] = Query(),
+) -> ForestObservationCatalog:
+    return ForestObservationCatalog.model_validate(
+        forest_monitoring.list_observations(river_id)
+    )
+
+
+@router.get(
+    "/gis/layers",
+    response_model=GISLayerCatalog,
+    tags=["gis"],
+)
+def get_gis_layers(
+    response: Response,
+    river_id: Literal["both", "kaveri", "tungabhadra"] = Query(default="both"),
+) -> GISLayerCatalog:
+    try:
+        result = GISLayerCatalog.model_validate(gis_explorer.list_layers(river_id))
+        response.headers["Cache-Control"] = "no-cache"
+        return result
+    except (OSError, sqlite3.Error) as error:
+        raise HTTPException(status_code=500, detail=f"GIS layer catalog could not be read: {error}") from error
+
+
+@router.get("/gis/layers/{layer_id}/metadata", response_model=GISLayer, tags=["gis"])
+def get_gis_layer_metadata(
+    layer_id: str,
+    response: Response,
+    river_id: Literal["both", "kaveri", "tungabhadra"] = Query(default="both"),
+) -> GISLayer:
+    try:
+        result = GISLayer.model_validate(gis_explorer.get_layer_metadata(layer_id, river_id))
+        response.headers["Cache-Control"] = "private, max-age=60"
+        return result
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/gis/layers/{layer_id}/features", tags=["gis"])
+def get_gis_layer_features(
+    layer_id: str,
+    response: Response,
+    river_id: Literal["both", "kaveri", "tungabhadra"] = Query(default="both"),
+) -> dict[str, Any]:
+    try:
+        result = gis_explorer.get_layer_features(layer_id, river_id)
+        response.headers["Cache-Control"] = "private, max-age=300"
+        return result
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/gis/layers/{layer_id}/preview.png", tags=["gis"])
+def get_gis_raster_preview(
+    layer_id: str,
+    river_id: Literal["both", "kaveri", "tungabhadra"] = Query(default="both"),
+) -> Response:
+    try:
+        image, bounds = gis_explorer.render_raster_preview(layer_id, river_id)
+        response = Response(
+            content=image,
+            media_type="image/png",
+            headers={"X-GIS-Bounds-WGS84": json.dumps(bounds, separators=(",", ":"))},
+        )
+        response.headers["Cache-Control"] = "private, max-age=300"
+        return response
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (OSError, rasterio.errors.RasterioError) as error:
+        raise HTTPException(status_code=500, detail=f"Raster preview failed: {error}") from error
+
+
+@router.get("/gis/layers/{layer_id}/download", tags=["gis"])
+def download_gis_layer(
+    layer_id: str,
+    river_id: Literal["both", "kaveri", "tungabhadra"] = Query(default="both"),
+    output_format: Literal["native", "csv"] = Query(default="native", alias="format"),
+):
+    try:
+        content, filename, media_type = gis_explorer.get_download(
+            layer_id, river_id, output_format
+        )
+        if isinstance(content, Path):
+            return FileResponse(
+                content,
+                media_type=media_type,
+                filename=filename,
+            )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post("/gis/inspect", tags=["gis"])
+def inspect_gis_location(request: GISInspectRequest) -> dict[str, Any]:
+    try:
+        return gis_explorer.inspect_location(request.model_dump())
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (OSError, rasterio.errors.RasterioError) as error:
+        raise HTTPException(status_code=500, detail=f"GIS inspection failed: {error}") from error
+
+
+@router.post("/gis/measure", tags=["gis"])
+def measure_gis_geometry(request: GISMeasurementRequest) -> dict[str, Any]:
+    try:
+        return gis_explorer.measure_geometry(request.geometry)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/gis/layers/import",
+    response_model=GISImportResponse,
+    status_code=201,
+    tags=["gis"],
+)
+async def import_gis_geojson(file: UploadFile = File(...)) -> GISImportResponse:
+    content = await file.read(gis_explorer.MAX_GEOJSON_BYTES + 1)
+    if len(content) > gis_explorer.MAX_GEOJSON_BYTES:
+        raise HTTPException(status_code=413, detail="GeoJSON upload exceeds the 10 MB size limit.")
+    try:
+        return GISImportResponse.model_validate(
+            {"layer": gis_explorer.import_geojson(content, file.filename)}
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        await file.close()
+
+
+@router.delete("/gis/layers/{layer_id}", tags=["gis"])
+def delete_gis_import(layer_id: str) -> dict[str, str]:
+    try:
+        gis_explorer.remove_imported_layer(layer_id)
+        return {"status": "removed", "layer_id": layer_id}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/forest/references",
+    response_model=ForestReferenceCatalog,
+    tags=["forest"],
+)
+def get_forest_references() -> ForestReferenceCatalog:
+    return ForestReferenceCatalog.model_validate(forest_monitoring.list_references())
+
+
+@router.post(
+    "/forest/references/import",
+    response_model=ForestReferenceImportResponse,
+    status_code=201,
+    tags=["forest"],
+)
+async def import_forest_reference(
+    dataset_id: Literal["esa-worldcover-2021-v200"] = Form(),
+    reference_file: UploadFile = File(),
+) -> ForestReferenceImportResponse:
+    try:
+        content = await reference_file.read(forest_monitoring.MAX_REFERENCE_BYTES + 1)
+        if len(content) > forest_monitoring.MAX_REFERENCE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Forest reference GeoTIFF exceeds the 100 MiB upload limit.",
+            )
+        return ForestReferenceImportResponse.model_validate(
+            forest_monitoring.import_worldcover_reference(dataset_id, content)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except (OSError, rasterio.errors.RasterioError) as error:
+        raise HTTPException(status_code=422, detail=f"Unable to read the forest reference GeoTIFF: {error}") from error
+    finally:
+        await reference_file.close()
+
+
+@router.post(
+    "/forest/analyses",
+    response_model=AcquisitionJob,
+    status_code=202,
+    tags=["forest"],
+)
+def submit_forest_analysis(request: ForestAnalysisRequest) -> AcquisitionJob:
+    try:
+        job_request = AcquisitionJobCreate(
+            river_id=request.river_id,
+            satellite="SENTINEL-2",
+            product_id=request.item_id,
+            job_type="forest_analysis",
+        )
+        return acquisition_jobs.create_job(
+            job_request,
+            parameters={"zone_distances_m": request.zone_distances_m},
+        )
+    except acquisition_jobs.ActiveJobConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}",
+    response_model=ForestAnalysisSummary,
+    tags=["forest"],
+)
+def get_forest_analysis(analysis_id: str) -> ForestAnalysisSummary:
+    try:
+        return ForestAnalysisSummary.model_validate(
+            forest_monitoring.get_analysis(analysis_id)
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/forest/analyses/{analysis_id}/tree-cover-jobs",
+    response_model=AcquisitionJob,
+    status_code=202,
+    tags=["forest"],
+)
+def submit_forest_tree_cover_job(
+    analysis_id: str,
+    request: ForestTreeCoverRequest,
+) -> AcquisitionJob:
+    try:
+        analysis_result = forest_monitoring.get_analysis(analysis_id)
+        forest_monitoring.get_imported_reference(request.reference_id)
+        job_request = AcquisitionJobCreate(
+            river_id=analysis_result["river_id"],
+            satellite="SENTINEL-2",
+            product_id=analysis_id,
+            job_type="forest_tree_cover",
+        )
+        return acquisition_jobs.create_job(
+            job_request,
+            parameters={"reference_id": request.reference_id},
+        )
+    except acquisition_jobs.ActiveJobConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/tree-cover/{reference_id}",
+    response_model=ForestTreeCoverStatistics,
+    tags=["forest"],
+)
+def get_forest_tree_cover_statistics(
+    analysis_id: str,
+    reference_id: str,
+) -> ForestTreeCoverStatistics:
+    try:
+        return ForestTreeCoverStatistics.model_validate(
+            forest_monitoring.get_tree_cover_summary(analysis_id, reference_id)
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/tree-cover/{reference_id}/tree-cover.tif",
+    tags=["forest"],
+)
+def download_forest_tree_cover_raster(
+    analysis_id: str,
+    reference_id: str,
+) -> FileResponse:
+    try:
+        path = forest_monitoring.get_tree_cover_output_path(
+            analysis_id, reference_id, "tree-cover.tif"
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="image/tiff",
+        filename=f"forest-tree-cover-{analysis_id[:12]}.tif",
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/tree-cover/{reference_id}/stats.csv",
+    tags=["forest"],
+)
+def download_forest_tree_cover_statistics(
+    analysis_id: str,
+    reference_id: str,
+) -> FileResponse:
+    try:
+        path = forest_monitoring.get_tree_cover_output_path(
+            analysis_id, reference_id, "stats.csv"
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"forest-tree-cover-statistics-{analysis_id[:12]}.csv",
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/tree-cover/{reference_id}/preview.png",
+    tags=["forest"],
+)
+def preview_forest_tree_cover(
+    analysis_id: str,
+    reference_id: str,
+) -> Response:
+    try:
+        image, bounds = forest_monitoring.render_tree_cover_preview(
+            analysis_id, reference_id
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, rasterio.errors.RasterioError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=f"Tree-cover preview is unavailable: {error}") from error
+    return Response(
+        content=image,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Bounds-WGS84": ",".join(str(value) for value in bounds.values()),
+        },
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/zones.geojson",
+    tags=["forest"],
+)
+def download_forest_zones(analysis_id: str) -> FileResponse:
+    try:
+        path = forest_monitoring.get_output_path(analysis_id, "zones.geojson")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="application/geo+json",
+        filename=f"forest-zones-{analysis_id[:12]}.geojson",
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/stats.csv",
+    tags=["forest"],
+)
+def download_forest_statistics(analysis_id: str) -> FileResponse:
+    try:
+        path = forest_monitoring.get_output_path(analysis_id, "stats.csv")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"forest-zone-statistics-{analysis_id[:12]}.csv",
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/indices/{index_name}.tif",
+    tags=["forest"],
+)
+def download_forest_index(analysis_id: str, index_name: Literal["ndvi", "evi", "ndmi"]) -> FileResponse:
+    try:
+        path = forest_monitoring.get_output_path(analysis_id, f"{index_name}.tif")
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="image/tiff",
+        filename=f"forest-{index_name}-{analysis_id[:12]}.tif",
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/preview/{index_name}.png",
+    tags=["forest"],
+)
+def preview_forest_index(analysis_id: str, index_name: Literal["ndvi", "evi", "ndmi"]) -> Response:
+    try:
+        image, bounds = forest_monitoring.render_preview(analysis_id, index_name)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except (OSError, rasterio.errors.RasterioError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=f"Forest index preview is unavailable: {error}") from error
+    return Response(
+        content=image,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Bounds-Web-Mercator": ",".join(str(value) for value in bounds),
+        },
+    )
+
+
+@router.get(
+    "/forest/analyses/{analysis_id}/evidence-summary",
+    response_model=ForestEvidenceSummary,
+    tags=["forest"],
+)
+def get_forest_evidence_summary(
+    analysis_id: str,
+    reference_id: str | None = Query(default=None),
+) -> ForestEvidenceSummary:
+    try:
+        analysis_result = forest_monitoring.get_analysis(analysis_id)
+        result = ai_analysis.summarize_forest_analysis(
+            analysis_result,
+            forest_monitoring.get_tree_cover_summary(analysis_id, reference_id)
+            if reference_id else None,
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ForestEvidenceSummary.model_validate(result)
 
 
 def _validate_analysis_metadata(request: WaterMaskRequest) -> None:
@@ -226,6 +695,7 @@ def create_workspace_report(request: WorkspaceReportRequest) -> StreamingRespons
     tags=["satellite"],
 )
 async def get_sentinel2_observations(
+    request: Request,
     river_id: str = Query(description="Supported river corridor."),
     refresh: bool = Query(default=False),
     limit: int = Query(default=8, ge=1, le=20),
@@ -238,6 +708,7 @@ async def get_sentinel2_observations(
             river_id,
             refresh,
             limit,
+            allow_discovery=not request.app.state.public_read_only,
         )
     except Exception as error:
         raise HTTPException(
@@ -259,16 +730,33 @@ def download_sentinel2_index(
         raise HTTPException(status_code=404, detail="Unknown river_id.")
     if "/" in item_id or "\\" in item_id or ".." in item_id:
         raise HTTPException(status_code=400, detail="Invalid Sentinel-2 item identifier.")
-    path = (sentinel2.DATA_ROOT / river_id / item_id / f"{index_name}.tif").resolve()
-    if sentinel2.DATA_ROOT.resolve() not in path.parents or not path.is_file():
-        raise HTTPException(status_code=404, detail="Sentinel-2 index output is unavailable.")
+    try:
+        path, quality = sentinel2.validate_index_download(river_id, item_id, index_name)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if format_name == "png":
         return Response(
             content=sentinel2.render_index_png(path, overview=overview),
             media_type="image/png",
             headers={"Cache-Control": "no-store"},
         )
-    return FileResponse(path, media_type="image/tiff", filename=path.name)
+    return FileResponse(
+        path,
+        media_type="image/tiff",
+        filename=f"{item_id}-{index_name}.tif",
+        headers={
+            "X-Raster-Valid-Pixels": str(quality["valid_pixels"]),
+            "X-Raster-Valid-Grid-Percent": f"{quality['raster_valid_percent']:.6f}",
+            "X-Centerline-Valid-Percent": f"{quality['valid_centerline_percent']:.6f}",
+            "X-Raster-Catalog-Georeferencing": (
+                "reconciled-from-geotiff"
+                if quality["catalog_georeferencing_reconciled"]
+                else "matched"
+            ),
+        },
+    )
 
 
 @router.post("/sentinel2/index-assessments", status_code=201, tags=["satellite"])

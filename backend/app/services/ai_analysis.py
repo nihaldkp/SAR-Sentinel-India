@@ -472,3 +472,69 @@ def build_river_analysis(
 
 def analyze_river(river_id: str, product_id: str | None = None) -> RiverAnalysisResponse:
     return build_river_analysis(acquisitions.get_catalog_status(), river_id, product_id)
+
+
+def summarize_forest_analysis(analysis: dict, tree_cover: dict | None = None) -> dict:
+    """Build a deterministic summary exclusively from persisted forest evidence."""
+    if analysis.get("status") not in {"completed", "no_data"}:
+        raise ValueError("The forest analysis does not have a supported completion status.")
+    findings = []
+    for zone in analysis.get("zones", []):
+        indices = []
+        for name in ("ndvi", "evi", "ndmi"):
+            stats = zone.get(name, {})
+            value = stats.get("mean")
+            indices.append(
+                f"{name.upper()} mean {value:.3f}" if isinstance(value, (int, float))
+                else f"{name.upper()} unavailable"
+            )
+        coverage = zone.get("valid_data_coverage_percent")
+        coverage_text = f"{coverage:.1f}% valid-data coverage" if isinstance(coverage, (int, float)) else "no raster coverage"
+        findings.append(
+            f"{zone.get('zone_id', 'Unknown zone')}: {', '.join(indices)}; {coverage_text}."
+        )
+    if not findings:
+        findings.append("No distance-zone statistics were persisted.")
+    if tree_cover is not None:
+        if tree_cover.get("analysis_id") != analysis.get("analysis_id"):
+            raise ValueError("Tree-cover evidence belongs to a different forest analysis.")
+        for zone in tree_cover.get("zones", []):
+            percentage = zone.get("tree_cover_percent_of_valid_area")
+            coverage = zone.get("valid_data_coverage_percent")
+            findings.append(
+                f"{zone.get('zone_id', 'Unknown zone')}: ESA WorldCover class 10 covers "
+                f"{percentage:.1f}% of valid reference pixels"
+                if isinstance(percentage, (int, float))
+                else f"{zone.get('zone_id', 'Unknown zone')}: no valid WorldCover pixels support a tree-cover estimate."
+            )
+            if isinstance(percentage, (int, float)) and isinstance(coverage, (int, float)):
+                findings[-1] += f" ({coverage:.1f}% valid-data coverage)."
+    if analysis.get("status") == "no_data":
+        conclusion = (
+            "The selected Sentinel-2 scene produced no usable vegetation-index pixels in the requested zones. "
+            "No tree-cover, forest-loss, or river-impact conclusion is supported."
+        )
+    elif tree_cover is not None:
+        conclusion = (
+            "The zone estimates describe ESA WorldCover 2021 class 10, not independently validated natural forest. "
+            "The class includes plantations, predates the Sentinel-2 observations, and cannot establish later loss, gain, or river-caused change."
+        )
+    else:
+        conclusion = (
+            "The reported values are one-date Sentinel-2 spectral vegetation-index observations. "
+            "They do not establish tree cover, forest loss, degradation, or a causal river–vegetation relationship."
+        )
+    return {
+        "analysis_id": analysis["analysis_id"],
+        "generated_at": datetime.now(timezone.utc),
+        "analysis_mode": "deterministic_evidence_summary",
+        "river_id": analysis["river_id"],
+        "item_id": analysis["item_id"],
+        "acquisition_datetime": analysis.get("acquisition_datetime"),
+        "observed_zone_summaries": findings,
+        "limitations": (
+            list(analysis.get("uncertainty_and_limitations", []))
+            + (list(tree_cover.get("limitations", [])) if tree_cover is not None else [])
+        ),
+        "conclusion": conclusion,
+    }

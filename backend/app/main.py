@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.services.acquisitions import (
     automatic_acquisition_enabled,
@@ -61,9 +63,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.state.public_read_only = os.getenv("SAR_PUBLIC_READ_ONLY", "false").strip().casefold() == "true"
+
+
+@app.middleware("http")
+async def restrict_public_operations(request: Request, call_next):
+    if request.app.state.public_read_only:
+        permitted_post = request.method == "POST" and request.url.path in {
+            "/api/reports/workspace",
+            "/api/sentinel2/comparisons",
+            "/api/analysis/ai-summary",
+        }
+        refresh_requested = (
+            request.url.path == "/api/sentinel2/observations"
+            and any(value.casefold() not in {"false", "0", "off", "no"}
+                    for value in request.query_params.getlist("refresh"))
+        )
+        if (request.method not in {"GET", "HEAD", "OPTIONS"} and not permitted_post) or refresh_requested:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "This operation is available only through the private administrative service."},
+            )
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
+    allow_origins=[origin.strip() for origin in os.getenv("SAR_CORS_ORIGINS", "").split(",") if origin.strip()],
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=False,
     allow_methods=["GET", "POST"],
